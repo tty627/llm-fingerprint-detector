@@ -16,6 +16,7 @@ import { fetchChatCompletion, ProbeRequestError } from './http.js'
 import { normalizeAnswer } from './normalizer.js'
 import type {
   CellId,
+  ProbeErrorKind,
   ProgressEvent,
   ReasoningAdapter,
   ResolvedEndpoint,
@@ -87,6 +88,8 @@ export async function runProbeBattery(options: SamplerOptions): Promise<SamplerR
   let consecutiveNetworkErrors = 0
   let fatalError: ProbeRunError | null = null
   let cursor = 0
+  let lastErrorKind: ProbeErrorKind | 'unknown' | null = null
+  let lastHttpStatus: number | null = null
 
   const recordSample = (sample: SampleResult) => {
     samples.push(sample)
@@ -98,6 +101,9 @@ export async function runProbeBattery(options: SamplerOptions): Promise<SamplerR
       total: queue.length,
       errors: errorCount,
       cellId: sample.cellId,
+      lastErrorKind,
+      lastHttpStatus,
+      retrying: false,
     })
   }
 
@@ -122,6 +128,21 @@ export async function runProbeBattery(options: SamplerOptions): Promise<SamplerR
           signal: options.signal,
           timeoutMs: options.timeoutMs,
           retries: options.maxRetries,
+          onRetry: (retry) => {
+            lastErrorKind = retry.kind
+            lastHttpStatus = retry.status
+            options.onProgress?.({
+              stage: 'sampling',
+              done: samples.length,
+              total: queue.length,
+              errors: errorCount,
+              cellId: job.cellId,
+              detail: `retry ${retry.attempt}/${retry.maxRetries} in ${Math.round(retry.delayMs)}ms`,
+              lastErrorKind,
+              lastHttpStatus,
+              retrying: true,
+            })
+          },
         })
         consecutiveNetworkErrors = 0
         const domain = getTaskSpec(job.cellId).domain
@@ -147,17 +168,11 @@ export async function runProbeBattery(options: SamplerOptions): Promise<SamplerR
           }
           if (error.kind === 'auth') {
             fatalError = new ProbeRunError('auth', error.message)
-            return
           }
+          lastErrorKind = error.kind
+          lastHttpStatus = error.status
           if (error.kind === 'network') {
             consecutiveNetworkErrors += 1
-            if (consecutiveNetworkErrors >= CONSECUTIVE_NETWORK_ERROR_LIMIT) {
-              fatalError = new ProbeRunError(
-                'network',
-                `Endpoint unreachable (${consecutiveNetworkErrors} consecutive transport errors): ${error.message}`,
-              )
-              return
-            }
           } else {
             consecutiveNetworkErrors = 0
           }
@@ -171,8 +186,21 @@ export async function runProbeBattery(options: SamplerOptions): Promise<SamplerR
             usage: null,
             arrivalIndex: arrivalIndex++,
             errorMessage: error.message,
+            errorKind: error.kind,
+            httpStatus: error.status,
           })
+          if (
+            error.kind === 'network' &&
+            consecutiveNetworkErrors >= CONSECUTIVE_NETWORK_ERROR_LIMIT
+          ) {
+            fatalError = new ProbeRunError(
+              'network',
+              `Endpoint unreachable (${consecutiveNetworkErrors} consecutive transport errors): ${error.message}`,
+            )
+          }
         } else {
+          lastErrorKind = 'unknown'
+          lastHttpStatus = null
           errorCount += 1
           recordSample({
             cellId: job.cellId,
@@ -183,6 +211,8 @@ export async function runProbeBattery(options: SamplerOptions): Promise<SamplerR
             usage: null,
             arrivalIndex: arrivalIndex++,
             errorMessage: error instanceof Error ? error.message : String(error),
+            errorKind: 'unknown',
+            httpStatus: null,
           })
         }
       }

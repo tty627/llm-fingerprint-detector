@@ -39,6 +39,8 @@ test('cell id round-trip', () => {
   assert.equal(cellId, 'random-number-1-100:zh')
   assert.deepEqual(parseCellId(cellId), { task: 'random-number-1-100', lang: 'zh' })
   assert.equal(isCellId('not-a-task:en'), false)
+  assert.equal(isCellId('constructor:en'), false)
+  assert.equal(isCellId('__proto__:zh'), false)
   assert.equal(isCellId('random-color:fr'), false)
 })
 

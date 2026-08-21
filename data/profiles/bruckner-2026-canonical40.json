@@ -1,0 +1,170 @@
+{
+  "profileId": "bruckner-2026-canonical40",
+  "profileVersion": "1.0.0",
+  "study": {
+    "paper": 1,
+    "label": "Study A"
+  },
+  "authors": [
+    {
+      "name": "Tomáš Bruckner",
+      "copyrightYear": 2026
+    }
+  ],
+  "source": {
+    "promptsVersion": "1.0.0",
+    "softwareDoi": "10.5281/zenodo.21278793",
+    "archiveFilename": "pamela-publish-code.zip",
+    "archiveMd5": "d81de3b8ef5c0bca74fd7c2bdbb41a6b",
+    "archiveSha256": "8a9c8db47609fd0682a44398e55a4e0b322cf3ae479c3189f0874aae928044ef",
+    "officialPromptsSha256": "32f4fc3ab5077438f362bb4d0c06d1ebbe2bb5d2e0809474045dcd60a6b592c1",
+    "canonicalPayloadSha256": "9ef56c982a503b4dba94710b63866aaff47db1e37cc34538e225acb9f5fe1341",
+    "normalizerSourcePath": "stats/01-normalize.js",
+    "normalizerSourceSha256": "8f755ca604e4814126c253f44135199b1636ddfedcb070fa4ece3368fb858fa8"
+  },
+  "paraphrasePolicy": "fixed",
+  "languages": [
+    "en",
+    "ru",
+    "zh",
+    "ar"
+  ],
+  "system_prompts": {
+    "en": "Answer with a single word or a single number only. Output nothing else: no explanation, no punctuation, no quotation marks.",
+    "ru": "Отвечай только одним словом или одним числом. Не выводи ничего больше: без объяснений, без знаков препинания, без кавычек.",
+    "zh": "只用一个词或一个数字回答。不要输出任何其他内容：不要解释，不要标点符号，不要引号。",
+    "ar": "أجب بكلمة واحدة أو رقم واحد فقط. لا تكتب أي شيء آخر: لا شرح ولا علامات ترقيم ولا علامات اقتباس."
+  },
+  "tasks": [
+    {
+      "id": "num100-random",
+      "category": "number",
+      "condition": "random",
+      "answer_space": "integer 1-100",
+      "normalize_as": "integer",
+      "prompts": {
+        "en": "Name a random number between 1 and 100.",
+        "ru": "Назови случайное число от 1 до 100.",
+        "zh": "说出一个1到100之间的随机数。",
+        "ar": "اذكر رقماً عشوائياً بين 1 و100."
+      }
+    },
+    {
+      "id": "num10-random",
+      "category": "number",
+      "condition": "random",
+      "answer_space": "integer 1-10",
+      "normalize_as": "integer",
+      "prompts": {
+        "en": "Name a random number between 1 and 10.",
+        "ru": "Назови случайное число от 1 до 10.",
+        "zh": "说出一个1到10之间的随机数。",
+        "ar": "اذكر رقماً عشوائياً بين 1 و10."
+      }
+    },
+    {
+      "id": "num-favorite",
+      "category": "number",
+      "condition": "favorite",
+      "answer_space": "any number",
+      "normalize_as": "integer",
+      "prompts": {
+        "en": "What is your favorite number? Name it.",
+        "ru": "Какое твоё любимое число? Назови его.",
+        "zh": "你最喜欢的数字是什么？说出它。",
+        "ar": "ما هو رقمك المفضل؟ اذكره."
+      }
+    },
+    {
+      "id": "letter-random",
+      "category": "letter",
+      "condition": "random",
+      "answer_space": "one letter/character of the language's native script",
+      "normalize_as": "grapheme",
+      "prompts": {
+        "en": "Name a random letter of the alphabet.",
+        "ru": "Назови случайную букву алфавита.",
+        "zh": "说出一个随机的汉字。",
+        "ar": "اذكر حرفاً عشوائياً من الحروف الأبجدية."
+      }
+    },
+    {
+      "id": "word-random",
+      "category": "word",
+      "condition": "random",
+      "answer_space": "any single word",
+      "normalize_as": "word",
+      "prompts": {
+        "en": "Name a random word.",
+        "ru": "Назови случайное слово.",
+        "zh": "说出一个随机的词。",
+        "ar": "اذكر كلمة عشوائية."
+      }
+    },
+    {
+      "id": "color-random",
+      "category": "color",
+      "condition": "random",
+      "answer_space": "color name",
+      "normalize_as": "word",
+      "prompts": {
+        "en": "Name a random color.",
+        "ru": "Назови случайный цвет.",
+        "zh": "说出一个随机的颜色。",
+        "ar": "اذكر لوناً عشوائياً."
+      }
+    },
+    {
+      "id": "color-favorite",
+      "category": "color",
+      "condition": "favorite",
+      "answer_space": "color name",
+      "normalize_as": "word",
+      "prompts": {
+        "en": "What is your favorite color? Name it.",
+        "ru": "Какой твой любимый цвет? Назови его.",
+        "zh": "你最喜欢的颜色是什么？说出它。",
+        "ar": "ما هو لونك المفضل؟ اذكره."
+      }
+    },
+    {
+      "id": "animal-random",
+      "category": "animal",
+      "condition": "random",
+      "answer_space": "animal name",
+      "normalize_as": "word",
+      "prompts": {
+        "en": "Name a random animal.",
+        "ru": "Назови случайное животное.",
+        "zh": "说出一个随机的动物。",
+        "ar": "اذكر حيواناً عشوائياً."
+      }
+    },
+    {
+      "id": "city-random",
+      "category": "city",
+      "condition": "random",
+      "answer_space": "city name",
+      "normalize_as": "word",
+      "prompts": {
+        "en": "Name a random city.",
+        "ru": "Назови случайный город.",
+        "zh": "说出一个随机的城市。",
+        "ar": "اذكر مدينة عشوائية."
+      }
+    },
+    {
+      "id": "coin-flip",
+      "category": "binary",
+      "condition": "random",
+      "answer_space": "heads|tails (language-specific pair)",
+      "normalize_as": "binary",
+      "prompts": {
+        "en": "Flip a coin. Answer \"heads\" or \"tails\".",
+        "ru": "Подбрось монету. Ответь «орёл» или «решка».",
+        "zh": "抛一枚硬币。回答“正面”或“反面”。",
+        "ar": "ارمِ قطعة نقود. أجب \"صورة\" أو \"كتابة\"."
+      }
+    }
+  ]
+}

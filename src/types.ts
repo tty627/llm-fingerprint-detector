@@ -115,11 +115,15 @@ export interface SampleResult {
   /** Arrival order across the whole run (used for the split-half self check). */
   arrivalIndex: number
   errorMessage?: string
+  /** Stable, credential-free error classification for progress reporting. */
+  errorKind?: ProbeErrorKind | 'unknown'
+  /** HTTP response status when the failure came from an HTTP response. */
+  httpStatus?: number | null
 }
 
 /** Aggregated answer distribution for one cell. */
-export interface CellDistribution {
-  cellId: CellId
+export interface StatisticalCellDistribution<TCellId extends string = string> {
+  cellId: TCellId
   /** Normalized answer → count (valid samples only). */
   counts: Record<string, number>
   validCount: number
@@ -137,12 +141,119 @@ export interface CellDistribution {
   meanReasoningTokens: number | null
 }
 
+/** V1 distribution, restricted to the built-in 8 task x 2 language battery. */
+export interface CellDistribution extends StatisticalCellDistribution<CellId> {}
+
 /**
- * A behavioral fingerprint: per-cell answer distributions plus collection
- * metadata. This is the JSON artifact written/read by the CLI.
+ * V2 protocol cell identifier. Runtime validation additionally bounds length
+ * and syntax; the open template supports paper cells beyond the legacy battery.
  */
-export interface Fingerprint {
-  formatVersion: 1
+export type ProtocolCellId = `${string}:${string}`
+
+/** Distribution for a self-described V2 protocol cell (for example `num100-random:ru`). */
+export interface V2CellDistribution extends StatisticalCellDistribution<ProtocolCellId> {}
+
+/** JSON values accepted by the canonical protocol serializer. */
+export type CanonicalJsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | CanonicalJsonValue[]
+  | { [key: string]: CanonicalJsonValue }
+
+/**
+ * Complete description of the protocol-defining choices for a V2 artifact.
+ * Digests identify the exact battery/prompts/normalizer content; human-readable
+ * ids alone are not sufficient for strict compatibility.
+ */
+export interface ProtocolManifest {
+  manifestVersion: 1
+  protocolId: string
+  battery: {
+    id: string
+    version: string
+    digest: string
+  }
+  prompts: {
+    systemPromptDigest: string
+    templateDigest: string
+  }
+  normalization: {
+    id: string
+    version: string
+    digest: string
+  }
+  sampling: {
+    temperature: number
+    topP: number | null
+    maxTokens: number
+    answerConstraint: string
+    reasoningPolicy: string
+  }
+}
+
+/** The requests a V2 collector committed to before sampling began. */
+export interface CollectionPlan {
+  planVersion: 1
+  role: 'enrollment' | 'audit'
+  cellIds: ProtocolCellId[]
+  samplesPerCell: number
+  expectedSamples: number
+  schedulerSeed: string
+  schedulerPolicy:
+    | 'repetition-index-seeded'
+    | 'bruckner-seeded-shuffle-mulberry32-v1'
+}
+
+/** Aggregate terminal outcomes for a V2 collection. */
+export interface CollectionQuality {
+  qualityVersion: 1
+  complete: boolean
+  completedSamples: number
+  expectedSamples: number
+  validSamples: number
+  invalidSamples: number
+  refusalSamples: number
+  emptySamples: number
+  errorSamples: number
+  /** Whether evidence came from the direct observable response channel without detected reasoning contamination. */
+  directness: 'verified' | 'claimed' | 'violated' | 'unknown'
+  /** Responses that exposed a reasoning trace in the collected raw evidence. */
+  reasoningTraceCount: number
+  /** Aggregate provider-reported reasoning tokens. */
+  reasoningTokenCount: number
+  /** Structurally successful responses that explicitly reported a reasoning-token count. */
+  reasoningUsageObservedSamples: number
+  /** SHA-256 of separately retained raw evidence, or null when none is retained. */
+  rawEvidenceSha256: string | null
+}
+
+export type CompatibilityIssueCode =
+  | 'invalid_fingerprint'
+  | 'legacy_v1'
+  | 'mixed_format_versions'
+  | 'manifest_mismatch'
+  | 'collection_plan_mismatch'
+
+export interface CompatibilityIssue {
+  code: CompatibilityIssueCode
+  message: string
+  side?: 'left' | 'right' | 'both'
+}
+
+export interface CompatibilityResult {
+  /** Valid V2 artifacts with identical manifests are protocol-compatible. */
+  compatible: boolean
+  status: 'compatible' | 'exploratory' | 'incompatible'
+  issues: CompatibilityIssue[]
+  leftFormatVersion: number | null
+  rightFormatVersion: number | null
+  manifestMatch: boolean | null
+  collectionPlanMatch: boolean | null
+}
+
+interface FingerprintBase {
   /**
    * Probe protocol identifier. Fingerprints are only strictly comparable when
    * both sides used the same protocol (same battery, same system prompt).
@@ -155,7 +266,19 @@ export interface Fingerprint {
   collectedAt: string
   samplesPerCell: number
   postReasoning: boolean
-  cells: Partial<Record<CellId, CellDistribution>>
+  /**
+   * Present only on an incremental checkpoint. Partial fingerprints preserve
+   * collected evidence but MUST NOT be used to produce an identity verdict.
+   */
+  partial?: true
+  /** Requests that have reached a terminal sample result in this checkpoint. */
+  completedSamples?: number
+  /** Total requests planned for the collection. */
+  expectedSamples?: number
+  /** Terminal request failures represented in this checkpoint. */
+  errorCount?: number
+  /** Machine-readable reason why this artifact is not a complete fingerprint. */
+  incompleteReason?: string
   meta?: {
     tool?: string
     channel?: string
@@ -165,10 +288,35 @@ export interface Fingerprint {
   }
 }
 
+/**
+ * Legacy artifact emitted by the original CLI. It remains readable and is the
+ * default output so the V2 protocol layer is additive and non-breaking.
+ */
+export interface FingerprintV1 extends FingerprintBase {
+  formatVersion: 1
+  cells: Partial<Record<CellId, CellDistribution>>
+}
+
+/**
+ * Self-describing artifact for strict protocol compatibility checks.
+ * Production collection does not emit this format until a future explicit
+ * opt-in path is introduced.
+ */
+export interface FingerprintV2 extends FingerprintBase {
+  formatVersion: 2
+  cells: Partial<Record<ProtocolCellId, V2CellDistribution>>
+  manifest: ProtocolManifest
+  plan: CollectionPlan
+  quality: CollectionQuality
+}
+
+/** Any supported fingerprint artifact. */
+export type Fingerprint = FingerprintV1 | FingerprintV2
+
 export type VerdictLevel = 'match' | 'uncertain' | 'mismatch' | 'insufficient'
 
 export interface CellComparison {
-  cellId: CellId
+  cellId: ProtocolCellId
   /** Jensen-Shannon divergence, base 2, in [0, 1] bit. */
   jsd: number
   validA: number
@@ -187,6 +335,12 @@ export interface ComparisonBaselines {
 export interface ComparisonResult {
   /** Mean per-cell JSD across comparable cells; null when none are comparable. */
   meanJsd: number | null
+  /** The historical labels are exploratory distance bands, not identity decisions. */
+  verdictSemantics: 'legacy-exploratory'
+  /** Legacy one-token/v1 results are never eligible for an operational decision. */
+  decisionEligible: false
+  /** Strict artifact/profile compatibility; null only for low-level legacy builder calls. */
+  compatibility: CompatibilityResult | null
   verdict: VerdictLevel
   /** Per-cell details, sorted by descending JSD. */
   cells: CellComparison[]
@@ -205,7 +359,17 @@ export interface ProgressEvent {
   errors: number
   cellId?: CellId
   strategy?: ReasoningStrategyId
+  /** Human-readable detail that never contains response bodies or credentials. */
+  detail?: string
+  /** Most recent safe error class, retained on later progress events. */
+  lastErrorKind?: ProbeErrorKind | 'unknown' | null
+  /** Most recent HTTP failure status, or null for non-HTTP failures. */
+  lastHttpStatus?: number | null
+  /** True while a retry backoff is pending for an in-flight sample. */
+  retrying?: boolean
 }
+
+export type ProbeErrorKind = 'network' | 'auth' | 'http' | 'timeout' | 'aborted'
 
 export interface FingerprintOptions {
   /**
@@ -224,6 +388,12 @@ export interface FingerprintOptions {
   /** Abort the whole run (in-flight requests are cancelled). */
   signal?: AbortSignal
   onProgress?: (event: ProgressEvent) => void
+  /**
+   * Called after adapter detection, after every completed sample, and once
+   * with the final complete fingerprint. Checkpoints are aggregate-only: raw
+   * prompts, responses and credentials are never included.
+   */
+  onCheckpoint?: (fingerprint: Fingerprint) => void
   /** Skip reasoning-adapter detection and use this adapter directly. */
   adapter?: ReasoningAdapter
   /** Keep raw per-sample results on the run result (off by default). */
@@ -253,6 +423,10 @@ export interface FingerprintRun {
 export interface VerifyResult {
   verdict: VerdictLevel
   meanJsd: number | null
+  /** The historical labels are exploratory distance bands, not identity decisions. */
+  verdictSemantics: 'legacy-exploratory'
+  /** Legacy one-token/v1 results are never eligible for an operational decision. */
+  decisionEligible: false
   comparison: ComparisonResult
   target: FingerprintRun
   reference: Fingerprint

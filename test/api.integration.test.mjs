@@ -137,6 +137,10 @@ test('verify(): same mock model → match, different mock model → mismatch', a
     options,
   )
   assert.equal(same.verdict, 'match')
+  assert.equal(same.verdictSemantics, 'legacy-exploratory')
+  assert.equal(same.decisionEligible, false)
+  assert.equal(same.comparison.verdictSemantics, 'legacy-exploratory')
+  assert.equal(same.comparison.decisionEligible, false)
   assert.ok(same.meanJsd < 0.25, `same model meanJsd should be small, got ${same.meanJsd}`)
 
   const different = await verify(
@@ -156,7 +160,9 @@ test('compare(): flags protocol mismatch', async () => {
   const foreign = { ...runA.fingerprint, protocol: 'someone-elses-protocol' }
   const result = compare(runA.fingerprint, foreign)
   assert.equal(result.protocolMismatch, true)
-  assert.equal(result.verdict, 'match') // identical distributions still match
+  assert.equal(result.verdict, 'match') // compatibility label is retained
+  assert.equal(result.verdictSemantics, 'legacy-exploratory')
+  assert.equal(result.decisionEligible, false)
 })
 
 test('fingerprint(): invalid API key aborts the run with an auth error', async () => {
@@ -196,4 +202,14 @@ test('endpoint validation: bad base URL rejects before any request', async () =>
   await assert.rejects(fingerprint({ baseUrl: '', model: 'x' }), /baseUrl is empty/)
   await assert.rejects(fingerprint({ baseUrl: 'https://ok.example/v1', model: ' ' }), /model is empty/)
   assert.ok(requestCount > 0)
+})
+
+test('fingerprint rejects Object prototype names supplied as runtime cell ids', async () => {
+  await assert.rejects(
+    fingerprint({ baseUrl, model: 'mock-alpha', apiKey: 'test-key' }, {
+      cells: ['constructor:en'],
+      samplesPerCell: 1,
+    }),
+    /unknown cell id/,
+  )
 })

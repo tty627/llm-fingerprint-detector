@@ -3,12 +3,24 @@
  * llm-fingerprint — CLI for fingerprinting and verifying LLM endpoints.
  *
  * The API key is read from an environment variable (never from a file, never
- * logged). Verify exit codes are CI-friendly:
+ * logged). Historical verify exit codes are retained for compatibility:
  *   0 match · 2 mismatch · 3 uncertain · 4 insufficient · 1 error
+ * These labels are legacy exploratory distance bands, not identity decisions.
  */
 
-import { readFileSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { randomBytes } from 'node:crypto'
+import {
+  closeSync,
+  fsyncSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import { basename, dirname, join, resolve } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
@@ -25,6 +37,12 @@ import {
   loadBundledReference,
   parseFingerprintJson,
 } from './reference.js'
+import {
+  collectBruckner2026PaperFingerprint,
+  paperSplitHalfByRepetitionIndex,
+  type PaperCollectionResult,
+} from './paper-collector.js'
+import { createOpenAICompatiblePaperTransport } from './paper-http.js'
 import { ProbeRunError } from './sampler.js'
 import type {
   CellId,
@@ -50,12 +68,22 @@ const VALUE_OPTIONS = new Set([
   '--preset',
   '--reference',
   '--out',
+  '--role',
+  '--scheduler-seed',
+  '--samples-out',
 ])
 const BOOLEAN_OPTIONS = new Set(['--json', '--quiet', '--help', '-h', '--version', '-V'])
 
 interface ParsedArgs {
   positionals: string[]
   options: Map<string, string | boolean>
+}
+
+class CliError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'CliError'
+  }
 }
 
 function parseArgs(argv: string[]): ParsedArgs {
@@ -91,8 +119,7 @@ function parseArgs(argv: string[]): ParsedArgs {
 }
 
 function fail(message: string): never {
-  process.stderr.write(`error: ${message}\n`)
-  process.exit(1)
+  throw new CliError(message)
 }
 
 function packageVersion(): string {
@@ -104,8 +131,8 @@ function packageVersion(): string {
   }
 }
 
-const HELP = `llm-fingerprint — fingerprint & verify LLMs behind OpenAI-compatible APIs
-Method: "One Token Is Enough" (Bruckner, arXiv:2607.10252)
+const HELP = `llm-fingerprint — compare LLM output distributions behind OpenAI-compatible APIs
+Inspired by: "One Token Is Enough" (Bruckner, arXiv:2607.10252)
 
 USAGE
   llm-fingerprint <command> [options]
@@ -115,13 +142,15 @@ COMMANDS
   verify        Fingerprint an endpoint and compare it to a reference
   compare       Compare two saved fingerprints (files or bundled ids)
   references    List bundled sample reference fingerprints
+  paper-fingerprint
+                Opt in to the exact T=1 Study-A 40-cell collection profile
 
 ENDPOINT OPTIONS
   --base-url <url>      OpenAI-compatible base URL, e.g. https://api.openai.com/v1
   --model <id>          Model id to request, e.g. gpt-4o-mini
   --api-key-env <name>  Env var holding the API key
                         (default: tries ${DEFAULT_KEY_ENV_VARS.join(', ')})
-  --api-key <key>       API key literal — avoid; prefer --api-key-env
+  --api-key <key>       Legacy commands only; paper-fingerprint rejects literals
 
 SAMPLING OPTIONS
   --cells <n|list>      Cell count 1-16 (top-N most discriminative) or a
@@ -129,7 +158,22 @@ SAMPLING OPTIONS
   --samples <n>         Samples per cell (default: ${DEFAULT_SAMPLES_PER_CELL})
   --preset <id>         quick (4×15) | standard (8×25) | strict (16×25)
   --concurrency <n>     Concurrent requests (default: ${DEFAULT_CONCURRENCY})
-  --timeout <ms>        Per-request timeout (default: 30000)
+  --timeout <ms>        Per-request timeout (legacy default: 30000;
+                        paper-fingerprint default: 90000)
+
+PAPER-FINGERPRINT (EXPLICIT OPT-IN)
+  --role <kind>         Required: enrollment | audit
+  --scheduler-seed <s> Required non-secret scheduler seed
+  --out <file>          Required V2 fingerprint output
+  --samples-out <file>  Required canonical raw-evidence JSONL sidecar
+  --samples <n>         Samples per each of 40 cells (default: 30)
+  --concurrency <n>     Concurrent requests (default: ${DEFAULT_CONCURRENCY})
+  This sends the pinned fixed prompts at T=1 and max_tokens=16. It is not a
+  full reproduction of the paper's EER evaluation, has no validated decision
+  policy, and does not produce a model-identity conclusion. Auth failures are
+  not retried; network/timeout failures get 5 retries per in-flight job. This
+  command uses environment-sourced keys when authentication is needed and
+  rejects literal keys.
 
 VERIFY / COMPARE
   --reference <src>     Reference fingerprint: a JSON file produced by
@@ -142,15 +186,17 @@ OUTPUT
   --help, -h            Show this help
   --version, -V         Show version
 
-EXIT CODES (verify)
+LEGACY COMPATIBILITY EXIT CODES (verify)
   0 match · 2 mismatch · 3 uncertain · 4 insufficient · 1 error
+  The labels preserve existing automation only; they are not calibrated
+  model-identity decisions (JSON: decisionEligible=false).
 
 EXAMPLES
   # Fingerprint an endpoint (key read from OPENAI_API_KEY)
   llm-fingerprint fingerprint --base-url https://api.openai.com/v1 \\
     --model gpt-4o-mini --out gpt-4o-mini.fingerprint.json
 
-  # Is this cheap reseller really serving gpt-4o-mini?
+  # Explore the distance between a reseller endpoint and a reference
   LLM_FINGERPRINT_API_KEY=sk-... llm-fingerprint verify \\
     --base-url https://cheap-api.example.com/v1 --model gpt-4o-mini \\
     --reference gpt-4o-mini.fingerprint.json
@@ -161,6 +207,11 @@ EXAMPLES
 
   # Compare two saved fingerprints offline
   llm-fingerprint compare a.fingerprint.json b.fingerprint.json
+
+  # Explicit paper-profile collection (1,200 requests at the default 30/cell)
+  llm-fingerprint paper-fingerprint --base-url https://api.example.com/v1 \
+    --model model-id --role enrollment --scheduler-seed enrollment-2026-08 \
+    --out enrollment.v2.json --samples-out enrollment.raw.jsonl
 
 Web version (no install): https://tosea.ai/free-tools/llm-api-fingerprint-checker
 `
@@ -205,8 +256,10 @@ function readSamplingOptions(args: ParsedArgs): FingerprintOptions {
       standard: { cells: 8, samples: 25 },
       strict: { cells: 16, samples: 25 },
     }
+    if (!Object.hasOwn(presets, preset)) {
+      fail(`Unknown preset "${preset}" (quick | standard | strict)`)
+    }
     const found = presets[preset]
-    if (!found) fail(`Unknown preset "${preset}" (quick | standard | strict)`)
     options.cells = found.cells
     options.samplesPerCell = found.samples
   }
@@ -254,31 +307,320 @@ function readSamplingOptions(args: ParsedArgs): FingerprintOptions {
   return options
 }
 
+interface PaperCliOptions {
+  role: 'enrollment' | 'audit'
+  schedulerSeed: string
+  out: string
+  samplesOut: string
+  samplesPerCell: number
+  concurrency: number
+  timeoutMs: number
+}
+
+function readPaperCliOptions(args: ParsedArgs): PaperCliOptions {
+  const role = args.options.get('--role')
+  if (role !== 'enrollment' && role !== 'audit') {
+    fail('--role is required and must be enrollment or audit')
+  }
+  const schedulerSeed = args.options.get('--scheduler-seed')
+  if (typeof schedulerSeed !== 'string' || schedulerSeed.trim().length === 0) {
+    fail('--scheduler-seed is required and must be non-empty')
+  }
+  if (schedulerSeed.length > 256) fail('--scheduler-seed must be at most 256 characters')
+
+  const out = args.options.get('--out')
+  if (typeof out !== 'string' || out.trim().length === 0) {
+    fail('--out is required for paper-fingerprint')
+  }
+  const samplesOut = args.options.get('--samples-out')
+  if (typeof samplesOut !== 'string' || samplesOut.trim().length === 0) {
+    fail('--samples-out is required for paper-fingerprint')
+  }
+  if (resolve(out) === resolve(samplesOut)) {
+    fail('--out and --samples-out must name different files')
+  }
+
+  const samples = args.options.get('--samples')
+  const samplesPerCell = typeof samples === 'string' ? Number(samples) : 30
+  if (!Number.isSafeInteger(samplesPerCell) || samplesPerCell <= 0) {
+    fail('--samples must be a positive integer')
+  }
+  const concurrencyValue = args.options.get('--concurrency')
+  const concurrency = typeof concurrencyValue === 'string'
+    ? Number(concurrencyValue)
+    : DEFAULT_CONCURRENCY
+  if (!Number.isSafeInteger(concurrency) || concurrency <= 0) {
+    fail('--concurrency must be a positive integer')
+  }
+  const timeoutValue = args.options.get('--timeout')
+  const timeoutMs = typeof timeoutValue === 'string' ? Number(timeoutValue) : 90_000
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 100) {
+    fail('--timeout must be ≥ 100 (milliseconds)')
+  }
+  return {
+    role,
+    schedulerSeed,
+    out,
+    samplesOut,
+    samplesPerCell,
+    concurrency,
+    timeoutMs,
+  }
+}
+
 function makeProgressRenderer(args: ParsedArgs): ((event: ProgressEvent) => void) | undefined {
   if (args.options.get('--quiet')) return undefined
   const isTty = process.stderr.isTTY === true
-  let lastPercent = -1
   return (event) => {
-    if (event.stage === 'adapter') {
+    if (!isTty) {
+      const detail =
+        event.detail ??
+        (event.stage === 'adapter' && event.strategy
+          ? `probing reasoning adapter (${event.strategy})`
+          : null)
       process.stderr.write(
-        isTty
-          ? `\rprobing reasoning adapter (${event.strategy})...          `
-          : `probing reasoning adapter (${event.strategy})...\n`,
+        `LLMFP_PROGRESS ${JSON.stringify({
+          stage: event.stage,
+          done: event.done,
+          total: event.total,
+          errors: event.errors,
+          detail,
+          lastErrorKind: event.lastErrorKind ?? null,
+          lastHttpStatus: event.lastHttpStatus ?? null,
+          retrying: event.retrying === true,
+        })}\n`,
       )
       return
     }
-    if (isTty) {
-      const errs = event.errors > 0 ? `, errors: ${event.errors}` : ''
-      process.stderr.write(`\rsampling ${event.done}/${event.total}${errs}          `)
-      if (event.done === event.total) process.stderr.write('\n')
-    } else {
-      const percent = Math.floor((event.done / event.total) * 10) * 10
-      if (percent > lastPercent) {
-        lastPercent = percent
-        process.stderr.write(`sampling ${event.done}/${event.total} (${percent}%)\n`)
+
+    if (event.stage === 'adapter') {
+      process.stderr.write(`\rprobing reasoning adapter (${event.strategy})...          `)
+      return
+    }
+    const errs = event.errors > 0 ? `, errors: ${event.errors}` : ''
+    const status = event.lastHttpStatus !== null && event.lastHttpStatus !== undefined
+      ? ` HTTP ${event.lastHttpStatus}`
+      : event.lastErrorKind
+        ? ` ${event.lastErrorKind}`
+        : ''
+    const retry = event.retrying ? `, retrying${status}` : ''
+    process.stderr.write(`\rsampling ${event.done}/${event.total}${errs}${retry}          `)
+    if (event.done === event.total && !event.retrying) process.stderr.write('\n')
+  }
+}
+
+function writeFingerprintAtomic(path: string, fingerprint: Fingerprint): void {
+  const temporary = `${path}.${process.pid}.tmp`
+  writeFileSync(temporary, `${JSON.stringify(fingerprint, null, 2)}\n`, 'utf8')
+  renameSync(temporary, path)
+}
+
+interface PreparedPaperOutput {
+  target: string
+  temporary: string
+  descriptor: number
+  closed: boolean
+  committed: boolean
+  backup: string | null
+}
+
+interface PreparedPaperOutputs {
+  fingerprint: PreparedPaperOutput
+  samples: PreparedPaperOutput
+}
+
+function pathState(path: string): 'missing' | 'file' | 'symlink' | 'directory' | 'other' {
+  try {
+    const stat = lstatSync(path)
+    if (stat.isDirectory()) return 'directory'
+    if (stat.isFile()) return 'file'
+    if (stat.isSymbolicLink()) return 'symlink'
+    return 'other'
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'missing'
+    throw error
+  }
+}
+
+function randomSiblingPath(target: string, label: string): string {
+  return join(
+    dirname(target),
+    `.${basename(target)}.${process.pid}.${randomBytes(16).toString('hex')}.${label}`,
+  )
+}
+
+function preparePaperOutput(targetPath: string): PreparedPaperOutput {
+  const target = resolve(targetPath)
+  const parent = dirname(target)
+  if (!statSync(parent).isDirectory()) fail(`Output parent is not a directory: ${parent}`)
+  const state = pathState(target)
+  if (state === 'directory' || state === 'other') {
+    fail(`Paper output target must be a regular file path: ${targetPath}`)
+  }
+
+  // A random same-directory file opened with O_EXCL prevents predictable-temp
+  // symlink attacks and proves writability before any network requests run.
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const temporary = randomSiblingPath(target, 'paper.tmp')
+    try {
+      const descriptor = openSync(temporary, 'wx', 0o600)
+      return {
+        target,
+        temporary,
+        descriptor,
+        closed: false,
+        committed: false,
+        backup: null,
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') continue
+      throw error
+    }
+  }
+  fail(`Could not reserve a secure temporary output beside ${targetPath}`)
+}
+
+function closePreparedOutput(output: PreparedPaperOutput): void {
+  if (output.closed) return
+  closeSync(output.descriptor)
+  output.closed = true
+}
+
+function abortPaperOutputs(outputs: PreparedPaperOutputs): void {
+  for (const output of [outputs.fingerprint, outputs.samples]) {
+    try {
+      closePreparedOutput(output)
+    } catch {
+      // Continue cleaning the other output.
+    }
+    if (!output.committed) {
+      try {
+        unlinkSync(output.temporary)
+      } catch {
+        // It may already have been renamed or removed.
       }
     }
   }
+}
+
+function preparePaperOutputs(
+  fingerprintPath: string,
+  samplesPath: string,
+): PreparedPaperOutputs {
+  const fingerprint = preparePaperOutput(fingerprintPath)
+  try {
+    const samples = preparePaperOutput(samplesPath)
+    return { fingerprint, samples }
+  } catch (error) {
+    try {
+      closePreparedOutput(fingerprint)
+    } catch {
+      // Preserve the preparation error.
+    }
+    try {
+      unlinkSync(fingerprint.temporary)
+    } catch {
+      // Preserve the preparation error.
+    }
+    throw error
+  }
+}
+
+function reserveBackupPath(target: string): string {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const backup = randomSiblingPath(target, 'paper.backup')
+    if (pathState(backup) === 'missing') return backup
+  }
+  throw new Error(`Could not reserve a backup path beside ${target}`)
+}
+
+function rollbackPaperOutputs(outputs: PreparedPaperOutputs): void {
+  for (const output of [outputs.fingerprint, outputs.samples]) {
+    try {
+      if (output.backup !== null) {
+        if (output.committed) {
+          try {
+            unlinkSync(output.target)
+          } catch {
+            // The final may already be absent; attempt restoration below.
+          }
+        }
+        renameSync(output.backup, output.target)
+        output.backup = null
+      } else if (output.committed) {
+        unlinkSync(output.target)
+      }
+    } catch {
+      // Preserve the original commit failure; recovery remains best-effort.
+    }
+    output.committed = false
+  }
+}
+
+function writePaperOutputsAtomic(
+  outputs: PreparedPaperOutputs,
+  result: PaperCollectionResult,
+): void {
+  try {
+    writeFileSync(
+      outputs.fingerprint.descriptor,
+      `${JSON.stringify(result.fingerprint, null, 2)}\n`,
+      'utf8',
+    )
+    writeFileSync(outputs.samples.descriptor, result.rawEvidenceJsonl, 'utf8')
+    fsyncSync(outputs.fingerprint.descriptor)
+    fsyncSync(outputs.samples.descriptor)
+    closePreparedOutput(outputs.fingerprint)
+    closePreparedOutput(outputs.samples)
+
+    // Recheck after collection so a target created during the network run
+    // cannot turn a commit into a directory replacement or special-file write.
+    for (const output of [outputs.fingerprint, outputs.samples]) {
+      const state = pathState(output.target)
+      if (state === 'directory' || state === 'other') {
+        throw new Error(`Paper output target changed to a non-file: ${output.target}`)
+      }
+    }
+    for (const output of [outputs.fingerprint, outputs.samples]) {
+      if (pathState(output.target) !== 'missing') {
+        output.backup = reserveBackupPath(output.target)
+        renameSync(output.target, output.backup)
+      }
+    }
+
+    // The fingerprint is the manifest that binds the sidecar hash, so expose
+    // the sidecar first and the fingerprint last. Any ordinary failure rolls
+    // both paths back to their previous state below.
+    renameSync(outputs.samples.temporary, outputs.samples.target)
+    outputs.samples.committed = true
+    renameSync(outputs.fingerprint.temporary, outputs.fingerprint.target)
+    outputs.fingerprint.committed = true
+
+    for (const output of [outputs.fingerprint, outputs.samples]) {
+      if (output.backup === null) continue
+      try {
+        unlinkSync(output.backup)
+        output.backup = null
+      } catch {
+        // The new pair is complete; retain an inaccessible random backup rather
+        // than report a false collection failure or remove the new outputs.
+      }
+    }
+  } catch (error) {
+    rollbackPaperOutputs(outputs)
+    abortPaperOutputs(outputs)
+    throw error
+  }
+}
+
+function requireCompleteFingerprint(fingerprint: Fingerprint, source: string): Fingerprint {
+  if (fingerprint.partial === true) {
+    fail(
+      `Incomplete partial fingerprint cannot be used for compare/verify: ${source} ` +
+        `(${fingerprint.completedSamples ?? 0}/${fingerprint.expectedSamples ?? '?'} samples)`,
+    )
+  }
+  return fingerprint
 }
 
 /** Load a reference: a JSON file path first, then a bundled sample id. */
@@ -289,9 +631,11 @@ function loadReference(source: string): Fingerprint {
   } catch {
     fileText = null
   }
-  if (fileText !== null) return parseFingerprintJson(fileText, source)
+  if (fileText !== null) {
+    return requireCompleteFingerprint(parseFingerprintJson(fileText, source), source)
+  }
   try {
-    return loadBundledReference(source)
+    return requireCompleteFingerprint(loadBundledReference(source), source)
   } catch (error) {
     fail(
       `"${source}" is neither a readable file nor a bundled reference id.\n${(error as Error).message}`,
@@ -302,13 +646,13 @@ function loadReference(source: string): Fingerprint {
 function verdictLabel(verdict: VerdictLevel): string {
   switch (verdict) {
     case 'match':
-      return 'MATCH — behavior is consistent with the reference'
+      return 'LOW-DISTANCE (legacy label: match)'
     case 'uncertain':
-      return 'UNCERTAIN — in the gray zone; collect more samples or a fresh reference'
+      return 'MID-DISTANCE (legacy label: uncertain)'
     case 'mismatch':
-      return 'MISMATCH — behavior differs from the reference'
+      return 'HIGH-DISTANCE (legacy label: mismatch)'
     case 'insufficient':
-      return 'INSUFFICIENT — not enough comparable cells for a verdict'
+      return 'INSUFFICIENT (legacy label: insufficient)'
   }
 }
 
@@ -328,15 +672,18 @@ function verdictExitCode(verdict: VerdictLevel): number {
 function renderComparison(result: ComparisonResult): string {
   const lines: string[] = []
   const mean = result.meanJsd === null ? 'n/a' : result.meanJsd.toFixed(3)
-  lines.push(`Verdict: ${verdictLabel(result.verdict)}`)
+  lines.push(`Legacy exploratory band: ${verdictLabel(result.verdict)}`)
+  lines.push(
+    `Semantics: ${result.verdictSemantics} · decision eligible: ${result.decisionEligible ? 'yes' : 'no'}`,
+  )
   lines.push(`Mean JSD: ${mean} over ${result.comparableCellCount} comparable cell(s)`)
   lines.push('')
-  lines.push('Interpretation scale (paper baselines, arXiv:2607.10252):')
+  lines.push('Published paper medians (context only; not calibration for this implementation):')
   lines.push(
     `  same model ≈ ${result.baselines.sameModelSelf} · same model, other provider ≈ ${result.baselines.sameModelCrossProvider} · different model ≈ ${result.baselines.differentModel}`,
   )
   lines.push(
-    `  thresholds: match ≤ ${result.thresholds.match} < uncertain ≤ ${result.thresholds.mismatch} < mismatch`,
+    `  local legacy bands: low ≤ ${result.thresholds.match} < mid ≤ ${result.thresholds.mismatch} < high`,
   )
   if (result.cells.length > 0) {
     lines.push('')
@@ -350,7 +697,7 @@ function renderComparison(result: ComparisonResult): string {
   if (result.protocolMismatch) {
     lines.push('')
     lines.push(
-      'note: the fingerprints were collected under different probe protocols; treat the verdict as indicative only.',
+      'note: protocol mismatch; only the raw distance is interpretable. Do not read the legacy band as a model-identity finding.',
     )
   }
   return lines.join('\n')
@@ -386,13 +733,16 @@ async function cmdFingerprint(args: ParsedArgs): Promise<number> {
   const endpoint = readEndpoint(args)
   const options = readSamplingOptions(args)
   options.onProgress = makeProgressRenderer(args)
+  const out = args.options.get('--out')
+  if (typeof out === 'string') {
+    options.onCheckpoint = (checkpoint) => writeFingerprintAtomic(out, checkpoint)
+  }
 
   const run = await fingerprint(endpoint, options)
   writeWarnings(run.warnings)
 
-  const out = args.options.get('--out')
   if (typeof out === 'string') {
-    writeFileSync(out, `${JSON.stringify(run.fingerprint, null, 2)}\n`, 'utf8')
+    writeFingerprintAtomic(out, run.fingerprint)
     process.stderr.write(`fingerprint written to ${out}\n`)
   }
 
@@ -409,6 +759,79 @@ async function cmdFingerprint(args: ParsedArgs): Promise<number> {
   return 0
 }
 
+function paperSafeSummary(result: PaperCollectionResult): Record<string, unknown> {
+  const splitHalf = paperSplitHalfByRepetitionIndex(result.evidence)
+  return {
+    artifactKind: 'paper-profile-collection-v2',
+    interpretation: 'uncalibrated-non-decision-evidence',
+    decisionEligible: false,
+    protocol: result.fingerprint.protocol,
+    model: result.fingerprint.model,
+    role: result.fingerprint.plan.role,
+    cellCount: result.fingerprint.plan.cellIds.length,
+    samplesPerCell: result.fingerprint.samplesPerCell,
+    expectedSamples: result.fingerprint.quality.expectedSamples,
+    validSamples: result.fingerprint.quality.validSamples,
+    invalidSamples: result.fingerprint.quality.invalidSamples,
+    errorSamples: result.fingerprint.quality.errorSamples,
+    directness: result.fingerprint.quality.directness,
+    splitHalfMeanJsd: splitHalf.meanJsd,
+    splitHalfComparableCells: splitHalf.cells.length,
+    rawEvidenceSha256: result.fingerprint.quality.rawEvidenceSha256,
+  }
+}
+
+async function cmdPaperFingerprint(args: ParsedArgs): Promise<number> {
+  if (typeof args.options.get('--api-key') === 'string') {
+    fail('paper-fingerprint forbids --api-key literals; use --api-key-env')
+  }
+  const endpoint = readEndpoint(args)
+  const paper = readPaperCliOptions(args)
+  const preparedOutputs = preparePaperOutputs(paper.out, paper.samplesOut)
+  const plannedRequests = 40 * paper.samplesPerCell
+  if (!args.options.get('--quiet')) {
+    process.stderr.write(
+      `paper-profile collection: ${plannedRequests} fixed-prompt requests ` +
+        `(${paper.role}, 40 cells × ${paper.samplesPerCell})\n`,
+    )
+  }
+
+  let result: PaperCollectionResult
+  try {
+    const request = createOpenAICompatiblePaperTransport({
+      baseUrl: endpoint.baseUrl,
+      apiKey: endpoint.apiKey,
+      timeoutMs: paper.timeoutMs,
+    })
+    result = await collectBruckner2026PaperFingerprint({
+      model: endpoint.model,
+      role: paper.role,
+      schedulerSeed: paper.schedulerSeed,
+      samplesPerCell: paper.samplesPerCell,
+      concurrency: paper.concurrency,
+      request,
+      abortOnRequestError: true,
+      abortOnProviderError: true,
+    })
+    writePaperOutputsAtomic(preparedOutputs, result)
+  } catch (error) {
+    abortPaperOutputs(preparedOutputs)
+    throw error
+  }
+  process.stderr.write(`paper-profile V2 fingerprint written to ${paper.out}\n`)
+  process.stderr.write(`canonical raw evidence written to ${paper.samplesOut}\n`)
+
+  const summary = paperSafeSummary(result)
+  if (args.options.get('--json')) {
+    process.stdout.write(
+      `${JSON.stringify({ fingerprint: result.fingerprint, collection: summary }, null, 2)}\n`,
+    )
+  } else {
+    process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`)
+  }
+  return 0
+}
+
 async function cmdVerify(args: ParsedArgs): Promise<number> {
   const referenceSource = args.options.get('--reference')
   if (typeof referenceSource !== 'string') {
@@ -418,13 +841,16 @@ async function cmdVerify(args: ParsedArgs): Promise<number> {
   const endpoint = readEndpoint(args)
   const options = readSamplingOptions(args)
   options.onProgress = makeProgressRenderer(args)
+  const out = args.options.get('--out')
+  if (typeof out === 'string') {
+    options.onCheckpoint = (checkpoint) => writeFingerprintAtomic(out, checkpoint)
+  }
 
   const result = await verify(endpoint, reference, options)
   writeWarnings(result.warnings)
 
-  const out = args.options.get('--out')
   if (typeof out === 'string') {
-    writeFileSync(out, `${JSON.stringify(result.target.fingerprint, null, 2)}\n`, 'utf8')
+    writeFingerprintAtomic(out, result.target.fingerprint)
     process.stderr.write(`target fingerprint written to ${out}\n`)
   }
 
@@ -472,27 +898,30 @@ function cmdReferences(args: ParsedArgs): number {
   process.stdout.write(
     `\nSource: ${attribution.dataset}\n` +
       `by ${attribution.author} — DOI ${attribution.datasetDoi} (${attribution.license})\n` +
-      'Collected under the paper\'s protocol: fine for demos; for high-stakes checks,\n' +
-      'collect your own reference with `llm-fingerprint fingerprint --out ...`.\n',
+      'Converted from the paper dataset into legacy sample artifacts. They do not\n' +
+      'share the local one-token/v1 protocol; use them for distance exploration only.\n' +
+      'For a local same-protocol comparison, collect your own reference.\n',
   )
   return 0
 }
 
 async function main(): Promise<void> {
-  const argv = process.argv.slice(2)
-  const args = parseArgs(argv)
-
-  if (args.options.get('--version') || args.options.get('-V')) {
-    process.stdout.write(`${packageVersion()}\n`)
-    process.exit(0)
-  }
-  const command = args.positionals.shift()
-  if (!command || args.options.get('--help') || args.options.get('-h') || command === 'help') {
-    process.stdout.write(HELP)
-    process.exit(0)
-  }
-
   try {
+    const argv = process.argv.slice(2)
+    const args = parseArgs(argv)
+
+    if (args.options.get('--version') || args.options.get('-V')) {
+      process.stdout.write(`${packageVersion()}\n`)
+      process.exitCode = 0
+      return
+    }
+    const command = args.positionals.shift()
+    if (!command || args.options.get('--help') || args.options.get('-h') || command === 'help') {
+      process.stdout.write(HELP)
+      process.exitCode = 0
+      return
+    }
+
     let exitCode: number
     switch (command) {
       case 'fingerprint':
@@ -507,20 +936,30 @@ async function main(): Promise<void> {
       case 'references':
         exitCode = cmdReferences(args)
         break
+      case 'paper-fingerprint':
+        exitCode = await cmdPaperFingerprint(args)
+        break
       default:
         fail(`Unknown command: ${command} (see --help)`)
     }
-    process.exit(exitCode)
+    // Do not call process.exit() after writing output. stdout is asynchronous
+    // when connected to a pipe, and forcing an exit can truncate large JSON
+    // responses before their pending writes have drained.
+    process.exitCode = exitCode
   } catch (error) {
+    let message: string
     if (error instanceof ProbeRunError) {
       const hints: Record<string, string> = {
         auth: 'The endpoint rejected the API key (401/403).',
         network: 'The endpoint is unreachable — check the base URL and your network.',
         aborted: 'Run cancelled.',
       }
-      fail(`${hints[error.reason] ?? ''} ${error.message}`.trim())
+      message = `${hints[error.reason] ?? ''} ${error.message}`.trim()
+    } else {
+      message = error instanceof Error ? error.message : String(error)
     }
-    fail(error instanceof Error ? error.message : String(error))
+    process.stderr.write(`error: ${message}\n`)
+    process.exitCode = 1
   }
 }
 

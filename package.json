@@ -18,6 +18,14 @@
       "types": "./dist/reference.d.ts",
       "import": "./dist/reference.js"
     },
+    "./profiles": {
+      "types": "./dist/profiles/index.d.ts",
+      "import": "./dist/profiles/index.js"
+    },
+    "./paper": {
+      "types": "./dist/paper.d.ts",
+      "import": "./dist/paper.js"
+    },
     "./package.json": "./package.json"
   },
   "bin": {
@@ -27,7 +35,8 @@
     "dist",
     "data",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",

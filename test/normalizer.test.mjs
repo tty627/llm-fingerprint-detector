@@ -16,6 +16,7 @@ test('English number words fold to digits', () => {
   assert.deepEqual(normalizeAnswer('forty-two', INT_100), { normalized: '42', category: 'valid' })
   assert.deepEqual(normalizeAnswer('Twelve', INT_100), { normalized: '12', category: 'valid' })
   assert.equal(parseAnyNumber('onehundred'), 100)
+  assert.equal(parseAnyNumber('constructor'), null)
 })
 
 test('Chinese numerals fold to digits', () => {
@@ -63,6 +64,10 @@ test('letters: single letters and letter names', () => {
   assert.deepEqual(normalizeAnswer('zee', LETTER), { normalized: 'z', category: 'valid' })
   assert.deepEqual(normalizeAnswer('queue', LETTER), { normalized: 'q', category: 'valid' })
   assert.equal(normalizeAnswer('hello', LETTER).category, 'invalid')
+  assert.deepEqual(normalizeAnswer('constructor', LETTER), {
+    normalized: 'constructor',
+    category: 'invalid',
+  })
 })
 
 test('coin: heads/tails variants in both languages', () => {

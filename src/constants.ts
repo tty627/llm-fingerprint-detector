@@ -1,26 +1,31 @@
 /**
- * Thresholds and statistical constants, centralized for calibration.
+ * Statistical constants used by the legacy `one-token/v1` implementation.
  *
- * Baselines from Bruckner, "One Token Is Enough" (arXiv:2607.10252):
- *  - same model, split-half distance (median)        ≈ 0.140
- *  - same model served by different providers (median) ≈ 0.227
- *  - different models (median)                        ≈ 0.463
- *  - equal error rate: ≈ 10.6% with 8 cells, ≈ 7.3% with 40 cells
- *
- * The match/mismatch cut points below sit between those baselines and leave a
- * deliberate "uncertain" band; they are heuristics, not proofs.
+ * The 0.25 / 0.35 cut points were selected by this project as convenient
+ * exploratory distance bands. They were not fitted or validated with the
+ * paper's evaluation pipeline, and MUST NOT be treated as calibrated identity
+ * decision thresholds.
  */
 
-/** meanJsd ≤ this → `match` (paper same-model cross-provider median 0.227, plus margin). */
-export const JSD_MATCH_THRESHOLD = 0.25
+/** Legacy low-distance band upper bound. Exploratory only; not decision eligible. */
+export const LEGACY_JSD_MATCH_THRESHOLD = 0.25
+
+/** Legacy mid-distance band upper bound. Exploratory only; not decision eligible. */
+export const LEGACY_JSD_MISMATCH_THRESHOLD = 0.35
 
 /**
- * meanJsd > this → `mismatch` (paper different-model median 0.463; impostor
- * distances rarely fall below ≈ 0.3). Between the two thresholds → `uncertain`.
+ * @deprecated Use `LEGACY_JSD_MATCH_THRESHOLD`. This alias is retained for API
+ * and downstream Python compatibility only.
  */
-export const JSD_MISMATCH_THRESHOLD = 0.35
+export const JSD_MATCH_THRESHOLD = LEGACY_JSD_MATCH_THRESHOLD
 
-/** Paper baseline anchors, exposed for result interpretation. */
+/**
+ * @deprecated Use `LEGACY_JSD_MISMATCH_THRESHOLD`. This alias is retained for
+ * API and downstream Python compatibility only.
+ */
+export const JSD_MISMATCH_THRESHOLD = LEGACY_JSD_MISMATCH_THRESHOLD
+
+/** Published paper medians, exposed as context only (not local calibration). */
 export const JSD_BASELINE_SELF = 0.14
 export const JSD_BASELINE_CROSS_PROVIDER = 0.227
 export const JSD_BASELINE_DIFFERENT_MODEL = 0.463
@@ -49,6 +54,8 @@ export const DEFAULT_CELL_COUNT = 8
 export const DEFAULT_CONCURRENCY = 4
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
 export const DEFAULT_MAX_RETRIES = 2
+/** Honor slow rate-limited relays while bounding a single Retry-After wait. */
+export const MAX_RETRY_DELAY_MS = 60_000
 /** Abort the run after this many consecutive transport-level failures. */
 export const CONSECUTIVE_NETWORK_ERROR_LIMIT = 8
 
