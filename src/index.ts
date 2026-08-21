@@ -36,6 +36,24 @@ export {
 export type { NormalizedAnswer } from './normalizer.js'
 
 export {
+  BRUCKNER_2026_NORMALIZER_ID,
+  BRUCKNER_2026_NORMALIZER_SOURCE_DOI,
+  BRUCKNER_2026_NORMALIZER_SOURCE_SHA256,
+  BRUCKNER_2026_NORMALIZER_VERSION,
+  normalizeBruckner2026Answer,
+  parseBruckner2026ChineseInteger,
+} from './normalizers/bruckner2026.js'
+export type {
+  Bruckner2026AnswerCategory,
+  Bruckner2026IntegerOptions,
+  Bruckner2026Language,
+  Bruckner2026NormalizeAs,
+  Bruckner2026NormalizedAnswer,
+  Bruckner2026NormalizerOptions,
+  Bruckner2026TextOptions,
+} from './normalizers/bruckner2026.js'
+
+export {
   buildCellDistribution,
   compareCellSets,
   domainSize,
@@ -47,6 +65,26 @@ export {
 export type { CellJsdEntry, CountMap } from './stats.js'
 
 export { decideVerdict, buildComparisonResult } from './verdict.js'
+
+export {
+  assertValidProtocolManifest,
+  canonicalSerialize,
+  checkCompatibility,
+  checkFingerprintCompatibility,
+  normalizeCanonicalJson,
+  serializeProtocolManifest,
+  validateProtocolManifest,
+} from './protocol.js'
+
+export {
+  FingerprintValidationError,
+  assertValidFingerprint,
+  isFingerprintV2,
+  isProtocolCellId,
+  isV2CellId,
+  validateFingerprint,
+} from './validation.js'
+export type { FingerprintValidationOptions } from './validation.js'
 
 export { detectReasoningAdapter, STRATEGY_BODIES } from './adapter.js'
 export type { AdapterDetectionOptions } from './adapter.js'
@@ -67,24 +105,36 @@ export type {
   CellComparison,
   CellDistribution,
   CellId,
+  CanonicalJsonValue,
+  CollectionPlan,
+  CollectionQuality,
   ComparisonBaselines,
   ComparisonResult,
+  CompatibilityIssue,
+  CompatibilityIssueCode,
+  CompatibilityResult,
   Endpoint,
   Fingerprint,
+  FingerprintV1,
+  FingerprintV2,
   FingerprintOptions,
   FingerprintRun,
+  ProtocolCellId,
   ProbeLang,
   ProbePreset,
   ProbePresetId,
   ProbeTaskId,
   ProbeTaskSpec,
   ProgressEvent,
+  ProtocolManifest,
   ReasoningAdapter,
   ReasoningStrategyId,
   ResolvedEndpoint,
   SampleCategory,
   SampleResult,
   SampleUsage,
+  StatisticalCellDistribution,
+  V2CellDistribution,
   VerdictLevel,
   VerifyResult,
 } from './types.js'

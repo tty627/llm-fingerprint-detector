@@ -19,6 +19,7 @@ import { fileURLToPath } from 'node:url'
 import { getTaskSpec, isCellId } from './battery.js'
 import { FINGERPRINT_FORMAT_VERSION } from './constants.js'
 import { domainSize, shannonEntropyBits } from './stats.js'
+import { validateFingerprint } from './validation.js'
 import type { CellDistribution, CellId, Fingerprint } from './types.js'
 
 export interface SampleReferenceSource {
@@ -134,15 +135,15 @@ function entryToFingerprint(id: string, entry: SampleReferenceEntry, file: Sampl
 /** Load one bundled reference as a runtime Fingerprint. */
 export function loadBundledReference(id: string): Fingerprint {
   const file = loadFile()
-  const entry = file.models[id]
-  if (!entry) {
+  if (!Object.hasOwn(file.models, id)) {
     const available = Object.keys(file.models).sort().join(', ')
     throw new Error(`Unknown bundled reference "${id}". Available: ${available}`)
   }
+  const entry = file.models[id]
   return entryToFingerprint(id, entry, file)
 }
 
-/** Parse and minimally validate a fingerprint JSON file produced by this tool. */
+/** Parse and strictly validate a complete V1 or V2 fingerprint JSON artifact. */
 export function parseFingerprintJson(text: string, sourceLabel = 'fingerprint file'): Fingerprint {
   let parsed: unknown
   try {
@@ -150,15 +151,5 @@ export function parseFingerprintJson(text: string, sourceLabel = 'fingerprint fi
   } catch (error) {
     throw new Error(`${sourceLabel} is not valid JSON: ${(error as Error).message}`)
   }
-  const fp = parsed as Partial<Fingerprint>
-  if (fp.formatVersion !== FINGERPRINT_FORMAT_VERSION) {
-    throw new Error(`${sourceLabel}: unsupported formatVersion ${String(fp.formatVersion)}`)
-  }
-  if (!fp.model || typeof fp.model !== 'string') {
-    throw new Error(`${sourceLabel}: missing "model"`)
-  }
-  if (!fp.cells || typeof fp.cells !== 'object') {
-    throw new Error(`${sourceLabel}: missing "cells"`)
-  }
-  return fp as Fingerprint
+  return validateFingerprint(parsed, { sourceLabel, rejectPartial: true })
 }

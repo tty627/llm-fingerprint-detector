@@ -5,28 +5,28 @@
 [![Runtime dependencies: 0](https://img.shields.io/badge/runtime%20deps-0-success.svg)](package.json)
 [![Paper: arXiv:2607.10252](https://img.shields.io/badge/paper-arXiv%3A2607.10252-b31b1b.svg)](https://arxiv.org/abs/2607.10252)
 
-**Is that API really serving the model it claims?** Fingerprint and verify any OpenAI-compatible LLM endpoint from single-token output distributions — no logits, no weights, no privileged access. Just ~100–400 cheap one-word completions. Catches **model substitution**, silent quantization and server-side prompt injection by API resellers, gateways and aggregators.
+Compare behavioral output distributions from OpenAI-compatible LLM endpoints — no logits, weights, or privileged access required. The current `one-token/v1` path produces exploratory distances; it does **not** by itself establish model identity, substitution, fraud, or provider provenance.
 
-An independent, open-source TypeScript implementation of:
+Inspired by:
 
 > Tomáš Bruckner, **"One Token Is Enough: Fingerprinting and Verifying Large Language Models from Single-Token Output Distributions"**, [arXiv:2607.10252](https://arxiv.org/abs/2607.10252).
 > Dataset: [DOI 10.5281/zenodo.21278557](https://doi.org/10.5281/zenodo.21278557) (CC-BY-4.0) · Paper code: [DOI 10.5281/zenodo.21278793](https://doi.org/10.5281/zenodo.21278793) (MIT)
 
-This package is **not affiliated with the paper's author** — it is a from-scratch implementation of the published method, engineered as a reusable library + CLI. If you use the method in research, cite the paper.
+This package is **not affiliated with the paper's author**. It is inspired by the published method, but its legacy `one-token/v1` battery, prompts, normalizer, sampling counts, and fixed `0.25/0.35` bands are not a faithful reproduction of the paper's full evaluation pipeline. If you use the paper's method in research, cite the paper; do not attribute this package's legacy thresholds or results to the paper.
 
 - **Zero runtime dependencies** — Node ≥ 18 built-in `fetch`, nothing else
 - **Library + CLI** — embed it, or run `llm-fingerprint verify` in CI
 - **Reasoning-model aware** — auto-detects how to disable hidden "thinking" (OpenRouter / Zhipu / OpenAI-style), with a graceful fallback
-- **Filter-resistant probes** — every probe is a plain semantic question drawn from a paraphrase pool; there is no magic string a gateway can special-case
+- **Legacy paraphrased probes** — `one-token/v1` draws from a paraphrase pool; this is a project-specific protocol choice, not the paper's fixed-prompt protocol
 - **Bundled sample references** for 11 popular models, derived from the paper's public dataset
 
-> Prefer a no-install web version? Try the free online checker: **[tosea.ai/free-tools/llm-api-fingerprint-checker](https://tosea.ai/free-tools/llm-api-fingerprint-checker)** — same method, runs entirely in your browser.
+> Prefer a no-install related interface? See **[tosea.ai/free-tools/llm-api-fingerprint-checker](https://tosea.ai/free-tools/llm-api-fingerprint-checker)**. Its results require the same calibration and provenance caveats described here.
 
 ---
 
 ## How it works
 
-LLMs answer "*Name a random number between 1 and 100*" with model-specific, surprisingly stable biases (GPT-family models love 42 and 73; other families prefer 57, 37, 7…). The paper's key result: the **empirical distribution of one-word answers** across a small battery of such tasks is a reliable *behavioral fingerprint* — stable across time, load and providers for the same model, and clearly different between models.
+LLMs can show repeatable biases when answering prompts such as "*Name a random number between 1 and 100*". The paper evaluates empirical single-token output distributions as behavioral fingerprints. This package's legacy protocol applies the general distance idea to a different battery and therefore needs its own calibration before its labels can support operational decisions.
 
 ```
  probe battery (task × language cells)      collect at temperature 1.0
@@ -37,13 +37,13 @@ LLMs answer "*Name a random number between 1 and 100*" with model-specific, surp
  └──────────────────────────────┘           └───────────┬─────────────┘
                                                         ▼
                 reference fingerprint  ──── mean per-cell Jensen-Shannon
-                (trusted endpoint)          divergence (base 2) ──▶ verdict
+                (reference endpoint)        divergence (base 2) ──▶ legacy distance band
 ```
 
 1. **Probe** — ask one-word questions (random numbers, colors, letters, coin flips…) in English and Chinese, `temperature=1.0`, `max_tokens=16`, a fixed minimal system prompt, hidden reasoning disabled. Requests are shuffled and paraphrased per call.
 2. **Normalize** — NFC, punctuation/emoji stripping, case folding, first word, digit unification (`seven`/`七`/`٧`/`７` → `7`), color and coin-word canonicalization; answers are classified valid / invalid / refusal / empty.
 3. **Compare** — per-cell Jensen-Shannon divergence (base 2, range 0–1 bit), averaged over cells where both sides have ≥10 valid samples.
-4. **Verdict** — three bands calibrated against the paper's baselines (see [Interpreting results](#interpreting-results)).
+4. **Legacy band** — the historical labels `match` / `uncertain` / `mismatch` are retained for compatibility, but are explicitly marked `verdictSemantics: "legacy-exploratory"` and `decisionEligible: false`.
 
 ## Install
 
@@ -53,7 +53,7 @@ npm install llm-fingerprint-detector    # library + `llm-fingerprint` CLI
 npx llm-fingerprint-detector --help
 ```
 
-Requires Node ≥ 18.17 (built-in `fetch`). The core library is runtime-agnostic and also works in browsers/edge runtimes; only the CLI and the bundled-reference loader touch the filesystem.
+Requires Node ≥ 18.17 (built-in `fetch`). The core library is runtime-agnostic and also works in browsers/edge runtimes; the CLI, bundled-reference loader, and explicit paper-profile subpath are Node-only.
 
 ## Quick start — CLI
 
@@ -74,21 +74,71 @@ llm-fingerprint verify \
 ```
 
 ```
-Verdict: MISMATCH — behavior differs from the reference
+Legacy exploratory band: HIGH-DISTANCE (legacy label: mismatch)
+Semantics: legacy-exploratory · decision eligible: no
 Mean JSD: 0.481 over 8 comparable cell(s)
 
-Interpretation scale (paper baselines, arXiv:2607.10252):
+Published paper medians (context only; not calibration for this implementation):
   same model ≈ 0.14 · same model, other provider ≈ 0.227 · different model ≈ 0.463
-  thresholds: match ≤ 0.25 < uncertain ≤ 0.35 < mismatch
+  local legacy bands: low ≤ 0.25 < mid ≤ 0.35 < high
 
 Per-cell JSD (most divergent first):
   random-number-1-100:en     0.712  (24 vs 25 valid)
   ...
 ```
 
-Exit codes are CI-friendly: `0` match · `2` mismatch · `3` uncertain · `4` insufficient · `1` error. API keys are only ever read from environment variables (`--api-key-env NAME`, defaulting to `LLM_FINGERPRINT_API_KEY` then `OPENAI_API_KEY`) and are never logged.
+For backward compatibility, legacy labels still map to exit codes `0` match · `2` mismatch · `3` uncertain · `4` insufficient · `1` error. Do not use those codes as an identity policy: inspect `decisionEligible`, which is currently always `false`. Prefer `--api-key-env NAME` (defaulting to `LLM_FINGERPRINT_API_KEY` then `OPENAI_API_KEY`). The legacy commands still accept `--api-key` for compatibility, but a literal can be exposed through shell history or the process list; `paper-fingerprint` rejects it.
 
 More: `llm-fingerprint --help`, [`examples/cli-examples.sh`](examples/cli-examples.sh).
+
+## Explicit opt-in: pinned T=1 Study-A profile
+
+The separate `paper-fingerprint` command runs the pinned **T=1, 10-task × 4-language (40-cell)** Study-A prompt profile. It uses the archived fixed system/user prompts, `temperature=1`, `max_tokens=16`, `reasoning: { enabled: false }`, and `usage: { include: true }`. It does not add `stream`, `top_p`, `seed`, prompt paraphrases, adapter probes, or a post-reasoning fallback.
+
+This path is deliberately not the default. It is a collection implementation, **not a full reproduction of the paper's EER experiment**: it does not run the separate T=0 arm, assemble the paper's model/provider cohort, or estimate thresholds and error rates. There is currently no validated decision policy, so its V2 artifact and raw samples are evidence for later calibration—not a model-identity, substitution, fraud, or provider-provenance conclusion.
+
+```bash
+export PAPER_ENDPOINT_KEY=sk-...
+llm-fingerprint paper-fingerprint \
+  --base-url https://api.example.com/v1 \
+  --model model-id \
+  --api-key-env PAPER_ENDPOINT_KEY \
+  --role enrollment \
+  --scheduler-seed enrollment-2026-08 \
+  --out enrollment.v2.json \
+  --samples-out enrollment.raw.jsonl
+```
+
+`--role`, `--scheduler-seed`, `--out`, and `--samples-out` are mandatory. The command also requires an environment-sourced key when authentication is needed; a literal `--api-key` is rejected. The default is 30 samples per cell (1,200 requests); override it with `--samples`. HTTP defaults follow the archived run configuration: a 90-second timeout, five retries after the initial attempt, and a 1 MiB successful-response limit. Non-success response bodies are cancelled rather than retained.
+
+The CLI stops scheduling new jobs after a thrown transport/authentication failure or an HTTP-200 provider-error payload, waits for at most the already in-flight concurrency window, and does not write final artifacts for that failed run. Thus 401/403 and provider-error failures, which are not retried, are bounded to roughly `concurrency` physical requests; a network/timeout failure may make up to six attempts for each of at most `concurrency` in-flight jobs, so its physical-request bound is roughly `6 × concurrency`.
+
+Both output paths are preflighted before network access. The CLI writes random, same-directory, mode-`0600` temporary files; each final rename is atomic, and ordinary two-file commit failures are rolled back to the previous pair. The V2 fingerprint binds the canonical JSONL sidecar by SHA-256. The transport applies an exact credential redactor to every response string retained in raw evidence (`raw`, provider, reported model, generation id, and finish reason). If an endpoint echoes the credential, the value is replaced with a marker and the entire sample is excluded as an error; transformed or encoded echoes cannot be recognized automatically. Caller-supplied `Authorization` and `Content-Type` compatibility headers are ignored and overwritten by the transport.
+
+`quality.directness` is `verified` only when every structurally successful response has `message.role: "assistant"`, exposes no recognized reasoning/thinking/analysis trace, and explicitly reports `reasoning_tokens: 0`. Missing role is a malformed response; missing reasoning usage makes directness `unknown`; positive tokens or a visible trace make it `violated` and exclude the contaminated sample. The paper collector never enables the legacy post-reasoning fallback, so its `postReasoning` field remains `false`; contamination is represented by the quality fields instead.
+
+Node library users must opt in through the Node-only subpath:
+
+```ts
+import {
+  collectBruckner2026PaperFingerprint,
+  createOpenAICompatiblePaperTransport,
+} from 'llm-fingerprint-detector/paper'
+
+const request = createOpenAICompatiblePaperTransport({
+  baseUrl: 'https://api.example.com/v1',
+  apiKey: process.env.PAPER_ENDPOINT_KEY,
+})
+const collected = await collectBruckner2026PaperFingerprint({
+  model: 'model-id',
+  role: 'audit',
+  schedulerSeed: 'audit-2026-08',
+  samplesPerCell: 30,
+  request,
+})
+```
+
+Retain `collected.rawEvidenceJsonl` separately and verify that its SHA-256 equals `collected.fingerprint.quality.rawEvidenceSha256`. Do not import this Node-only collector from browser bundles or treat its output as an operational verdict.
 
 ## Quick start — library
 
@@ -108,7 +158,9 @@ const result = await verify(
   { baseUrl: 'https://suspect.example.com/v1', model: 'gpt-4o-mini', apiKey: process.env.SUSPECT_KEY },
   run.fingerprint,
 )
-console.log(result.verdict, result.meanJsd)   // 'match' | 'uncertain' | 'mismatch' | 'insufficient'
+console.log(result.verdict, result.meanJsd)   // legacy compatibility label + raw distance
+console.log(result.verdictSemantics)          // 'legacy-exploratory'
+console.log(result.decisionEligible)          // false
 
 // Or compare two saved fingerprints offline
 const distance = compare(fingerprintA, fingerprintB)
@@ -125,9 +177,9 @@ const result = await verify(suspectEndpoint, reference)
 
 Runnable examples: [`examples/01-fingerprint-endpoint.mjs`](examples/01-fingerprint-endpoint.mjs), [`examples/02-verify-endpoint.mjs`](examples/02-verify-endpoint.mjs).
 
-## Tutorial: "Is my cheap API really GPT-4o / Claude / DeepSeek?"
+## Tutorial: explore how far two endpoint distributions differ
 
-You bought API access from a reseller/aggregator at half price. Are you getting the real model, a cheaper substitute, or a quantized clone? Ten minutes:
+The legacy workflow can help you measure behavioral divergence between a reference endpoint and another endpoint. It cannot answer model identity on its own:
 
 1. **Collect a trusted reference.** Fingerprint the *official* API (or any endpoint you fully trust) for the model in question:
 
@@ -136,7 +188,7 @@ You bought API access from a reseller/aggregator at half price. Are you getting 
      --model gpt-4o-mini --api-key-env OFFICIAL_KEY --out ref.json
    ```
 
-   No official access? Start with a bundled sample (`llm-fingerprint references`) — good enough for a first signal, with the caveats below.
+   No official access? A bundled sample (`llm-fingerprint references`) can demonstrate the mechanics, but it uses a different protocol and is not decision-eligible evidence.
 
 2. **Verify the suspect endpoint** with the *same* model id:
 
@@ -145,37 +197,38 @@ You bought API access from a reseller/aggregator at half price. Are you getting 
      --model gpt-4o-mini --api-key-env RESELLER_KEY --reference ref.json
    ```
 
-3. **Read the verdict.**
-   - `match` — the endpoint's one-token behavior is statistically consistent with your reference. That is strong (not absolute) evidence it's the same model.
-   - `mismatch` — the behavior is as far from the reference as *different* models typically are. Common causes, in practice: a substituted cheaper model, a heavily quantized deployment, or an injected system prompt.
-   - `uncertain` — the gray zone. Raise `--samples` (e.g. 40), use `--preset strict` (all 16 cells), or refresh your reference — models drift when providers ship updates.
-   - Also watch the warnings: a high **split-half JSD** means the endpoint disagrees *with itself* between the first and second half of your own run — a classic sign of an aggregator rotating several backends.
+3. **Read the distance and legacy band.**
+   - `match` means only that the raw distance fell in the historical low-distance band (`≤ 0.25`).
+   - `mismatch` means only that the raw distance fell in the historical high-distance band (`> 0.35`). Many factors besides model identity can change a distribution.
+   - `uncertain` is the historical middle band. More samples can reduce sampling noise, but cannot turn an uncalibrated band into a calibrated identity decision.
+   - A high **split-half JSD** indicates instability within the run. It may merit investigation, but it does not identify the cause.
 
-4. **Re-run before you conclude anything.** Two independent mismatch runs on different days are a much stronger signal than one.
+4. **Investigate rather than conclude from this label.** Check protocol equality, reference provenance and freshness, reasoning behavior, request errors, prompt injection, and independent evidence.
 
 ## Interpreting results
 
-Distances are mean Jensen-Shannon divergence (base 2), so 0 = identical behavior, 1 = disjoint answer sets. Paper baselines:
+Distances are mean Jensen-Shannon divergence (base 2), so 0 = identical observed distributions and 1 = disjoint observed answer sets. The table deliberately separates published paper medians from this project's uncalibrated legacy bands:
 
-| meanJsd | reading |
+| meanJsd | status |
 |---|---|
-| ≈ 0.14 | same model, same endpoint (sampling noise floor) |
-| ≈ 0.227 | same model, different provider (median) |
-| **≤ 0.25** | → verdict **match** |
-| 0.25 – 0.35 | → verdict **uncertain** |
-| **> 0.35** | → verdict **mismatch** |
-| ≈ 0.463 | different models (median) |
+| ≈ 0.14 | paper-reported median for its same-model split-half setup; context only |
+| ≈ 0.227 | paper-reported same-model cross-provider median; context only |
+| **≤ 0.25** | local legacy low-distance band; JSON label `match` |
+| 0.25 – 0.35 | local legacy middle-distance band; JSON label `uncertain` |
+| **> 0.35** | local legacy high-distance band; JSON label `mismatch` |
+| ≈ 0.463 | paper-reported different-model median; context only |
 
-**Error rates (paper):** distinguishing same-model vs different-model pairs achieves an equal error rate of ≈ **10.6% with 8 cells** and ≈ **7.3% with 40 cells**. A single run is *evidence*, not proof — treat verdicts accordingly.
+The paper's reported error rates belong to its own exact dataset, cell matrix, prompts, normalizer, split design and evaluation procedure. They cannot be inherited by `one-token/v1`, its 8/16-cell presets, the bundled converted samples, or the `0.25/0.35` bands. Calibrate an explicit policy on representative same-model and known-different controls before enabling any operational decision.
 
 ### Limitations you must know
 
 - **Fingerprints drift.** Providers silently update models; a 3-month-old reference can legitimately mismatch today's deployment. Always check `collectedAt`, refresh references regularly.
-- **You need a trusted reference.** The method compares two endpoints; it cannot conjure ground truth. If your reference is wrong, your verdict is wrong.
+- **A reference needs verified provenance.** A label or model id does not make a reference official ground truth.
+- **Protocol equality is mandatory for interpretation.** When `protocolMismatch` is true, only the raw distance is reported; the legacy band must not be read as an identity finding.
 - **The system prompt must be identical on both sides.** Swapping only the system prompt shifts fingerprints by JSD ≈ 0.44–0.46 — the magnitude of a model swap. This tool pins the same minimal system prompt on both sides automatically; if an endpoint *injects* its own server-side prompt, that will (correctly) surface as divergence.
 - **Reasoning fallback lowers confidence.** When hidden reasoning can't be disabled, the run is flagged `postReasoning` — distributions shift measurably in that channel.
 - **Quantization/serving stack changes** the same weights can move distances into the uncertain band.
-- **A mismatch is a statistical observation, not an accusation.** Do not treat any single verdict as proof of fraud by a provider; investigate, re-run, and compare notes before drawing conclusions.
+- **Legacy labels are not decisions.** `verdictSemantics` is `legacy-exploratory` and `decisionEligible` is `false`, including for same-protocol comparisons. A `match` or `mismatch` string is retained only for compatibility.
 
 ## Bundled sample references
 
@@ -183,7 +236,7 @@ Distances are mean Jensen-Shannon divergence (base 2), so 0 = identical behavior
 
 > Bruckner, T. (2026). *Single-token output distributions as behavioral fingerprints of large language models* [Data set]. Zenodo. [https://doi.org/10.5281/zenodo.21278557](https://doi.org/10.5281/zenodo.21278557) — CC-BY-4.0. Counts reconstructed from the published per-cell distributions and re-normalized with this package's normalizer (see [`scripts/build-sample-references.mjs`](scripts/build-sample-references.mjs)).
 
-Those samples were collected by the paper's harness (via OpenRouter) under the paper's prompt protocol — close to, but not identical to, this package's battery. `compare()` flags such pairs with `protocolMismatch: true` and the verdict should be read as *indicative*. For anything that matters, collect your own reference:
+Those source samples were collected by the paper's harness (via OpenRouter), then converted into this package's `bruckner-zenodo-2026` legacy artifact format. They are not official-provider ground truth and do not share the local `one-token/v1` protocol. `compare()` flags cross-protocol pairs with `protocolMismatch: true`; use the resulting JSD only as an exploratory distance and do not interpret the compatibility `verdict` as an identity conclusion. For a local same-protocol comparison, collect your own reference:
 
 ```bash
 llm-fingerprint fingerprint --base-url <trusted-url> --model <id> --out my-reference.json
@@ -201,14 +254,15 @@ node scripts/build-sample-references.mjs path/to/distributions.json --models ope
 | export | what it does |
 |---|---|
 | `fingerprint(endpoint, options?)` | probe an endpoint → `FingerprintRun` (fingerprint, adapter, split-half, warnings) |
-| `compare(a, b)` | two fingerprints → `ComparisonResult` (meanJsd, per-cell JSD, verdict, baselines) |
-| `verify(endpoint, reference, options?)` | fingerprint + compare in one call → `VerifyResult` |
+| `compare(a, b)` | two fingerprints → distance plus a legacy compatibility label (`decisionEligible: false`) |
+| `verify(endpoint, reference, options?)` | fingerprint + compare in one call; still exploratory until a policy is calibrated |
 | `normalizeAnswer(raw, domain)` | the full normalization pipeline (pure, unit-tested) |
 | `jensenShannonDivergence(p, q)` | base-2 JSD over count maps |
 | `splitHalfJsd(samplesByCell)` | endpoint self-consistency check |
 | `detectReasoningAdapter(endpoint)` | which reasoning-disable field the endpoint accepts |
 | `PROBE_TASKS`, `CELL_PRIORITY_ORDER`, `SYSTEM_PROMPTS` | the battery itself |
 | `llm-fingerprint-detector/references` | bundled sample loader (Node only) |
+| `llm-fingerprint-detector/paper` | explicit Node-only pinned T=1 Study-A 40-cell collector and strict HTTP adapter |
 
 All options (`cells`, `samplesPerCell`, `concurrency`, `timeoutMs`, `maxRetries`, `signal`, `onProgress`, …) are documented in [`src/types.ts`](src/types.ts).
 
@@ -230,7 +284,7 @@ Issues and PRs are welcome. Especially valuable:
 
 - **More languages** in the probe battery (the paper also used Arabic and Russian) — requires matching normalizer support, see `src/normalizer.ts`
 - **Reference fingerprints** for more models/providers, collected with this tool's protocol (`one-token/v1`) and a documented date/channel
-- **Threshold calibration data**: pairs of same-model / different-model runs to sharpen the match/mismatch cut points
+- **Protocol-specific calibration data**: representative same-model and known-different controls for a separately versioned decision policy
 
 Please keep changes dependency-free and covered by `node --test` tests.
 

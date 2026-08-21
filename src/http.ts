@@ -8,10 +8,14 @@
  * to the endpoint under test; it is never logged or sent anywhere else.
  */
 
-import { DEFAULT_MAX_RETRIES, DEFAULT_REQUEST_TIMEOUT_MS } from './constants.js'
-import type { ResolvedEndpoint, SampleUsage } from './types.js'
+import {
+  DEFAULT_MAX_RETRIES,
+  DEFAULT_REQUEST_TIMEOUT_MS,
+  MAX_RETRY_DELAY_MS,
+} from './constants.js'
+import type { ProbeErrorKind, ResolvedEndpoint, SampleUsage } from './types.js'
 
-export type ProbeErrorKind = 'network' | 'auth' | 'http' | 'timeout' | 'aborted'
+export type { ProbeErrorKind } from './types.js'
 
 export class ProbeRequestError extends Error {
   readonly kind: ProbeErrorKind
@@ -83,10 +87,51 @@ export interface ChatCompletionRequest {
   signal?: AbortSignal
   timeoutMs?: number
   retries?: number
+  onRetry?: (event: RetryEvent) => void
+}
+
+export interface RetryEvent {
+  /** One-based retry number (the request attempt that will run next). */
+  attempt: number
+  maxRetries: number
+  kind: ProbeErrorKind
+  status: number | null
+  delayMs: number
+}
+
+/** Parse either Retry-After seconds or an HTTP date, then apply the hard cap. */
+export function parseRetryAfterMs(value: string | null, nowMs = Date.now()): number | null {
+  if (value === null || value.trim() === '') return null
+  const seconds = Number(value)
+  let parsed: number
+  if (Number.isFinite(seconds)) {
+    parsed = seconds * 1_000
+  } else {
+    const timestamp = Date.parse(value)
+    if (!Number.isFinite(timestamp)) return null
+    parsed = timestamp - nowMs
+  }
+  return Math.min(MAX_RETRY_DELAY_MS, Math.max(0, parsed))
+}
+
+/** Provider delay when valid, otherwise bounded exponential backoff. */
+export function retryDelayMs(
+  retryAfter: string | null,
+  attempt: number,
+  randomFraction = Math.random(),
+): number {
+  const providerDelay = parseRetryAfterMs(retryAfter)
+  if (providerDelay !== null) return providerDelay
+  const exponential = 800 * 2 ** attempt + Math.max(0, Math.min(1, randomFraction)) * 400
+  return Math.min(MAX_RETRY_DELAY_MS, exponential)
 }
 
 async function delay(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new ProbeRequestError('aborted', 'Aborted'))
+      return
+    }
     const timer = setTimeout(() => {
       signal?.removeEventListener('abort', onAbort)
       resolve()
@@ -96,6 +141,8 @@ async function delay(ms: number, signal?: AbortSignal): Promise<void> {
       reject(new ProbeRequestError('aborted', 'Aborted'))
     }
     signal?.addEventListener('abort', onAbort, { once: true })
+    // Close the tiny race between the check above and listener registration.
+    if (signal?.aborted) onAbort()
   })
 }
 
@@ -155,12 +202,16 @@ export async function fetchChatCompletion(
       }
       if (response.status === 429 || response.status >= 500) {
         const retryAfterHeader = response.headers.get('retry-after')
-        const retryAfterMs = retryAfterHeader ? Number(retryAfterHeader) * 1000 : NaN
         lastError = new ProbeRequestError('http', `HTTP ${response.status}`, response.status)
         if (attempt < retries) {
-          const backoff = Number.isFinite(retryAfterMs)
-            ? retryAfterMs
-            : 800 * 2 ** attempt + Math.random() * 400
+          const backoff = retryDelayMs(retryAfterHeader, attempt)
+          request.onRetry?.({
+            attempt: attempt + 1,
+            maxRetries: retries,
+            kind: lastError.kind,
+            status: lastError.status,
+            delayMs: backoff,
+          })
           await delay(backoff, request.signal)
           continue
         }
@@ -202,6 +253,13 @@ export async function fetchChatCompletion(
         )
       }
       if (lastError.kind === 'timeout' && attempt < retries) {
+        request.onRetry?.({
+          attempt: attempt + 1,
+          maxRetries: retries,
+          kind: lastError.kind,
+          status: lastError.status,
+          delayMs: 0,
+        })
         continue
       }
       throw lastError

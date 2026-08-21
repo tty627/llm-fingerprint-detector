@@ -8,7 +8,13 @@
  */
 
 import { MIN_SPLIT_HALF_SAMPLES, MIN_VALID_SAMPLES_PER_CELL } from './constants.js'
-import type { AnswerDomain, CellDistribution, CellId, SampleResult } from './types.js'
+import type {
+  AnswerDomain,
+  CellDistribution,
+  CellId,
+  ProtocolCellId,
+  SampleResult,
+} from './types.js'
 
 export type CountMap = Record<string, number>
 
@@ -80,7 +86,7 @@ export function buildCellDistribution(
   samples: SampleResult[],
   domain: AnswerDomain,
 ): CellDistribution {
-  const counts: CountMap = {}
+  const counts = Object.create(null) as CountMap
   let validCount = 0
   let invalidCount = 0
   let refusalCount = 0
@@ -131,7 +137,7 @@ export function buildCellDistribution(
 
   return {
     cellId,
-    counts,
+    counts: { ...counts },
     validCount,
     invalidCount,
     refusalCount,
@@ -147,7 +153,7 @@ export function buildCellDistribution(
 }
 
 export interface CellJsdEntry {
-  cellId: CellId
+  cellId: ProtocolCellId
   jsd: number
   validA: number
   validB: number
@@ -159,12 +165,12 @@ export interface CellJsdEntry {
  * by descending JSD.
  */
 export function compareCellSets(
-  cellsA: Partial<Record<CellId, { counts: CountMap; validCount: number }>>,
-  cellsB: Partial<Record<CellId, { counts: CountMap; validCount: number }>>,
+  cellsA: Partial<Record<ProtocolCellId, { counts: CountMap; validCount: number }>>,
+  cellsB: Partial<Record<ProtocolCellId, { counts: CountMap; validCount: number }>>,
   minValidSamples: number = MIN_VALID_SAMPLES_PER_CELL,
 ): { entries: CellJsdEntry[]; meanJsd: number | null } {
   const entries: CellJsdEntry[] = []
-  for (const cellId of Object.keys(cellsA) as CellId[]) {
+  for (const cellId of Object.keys(cellsA) as ProtocolCellId[]) {
     const a = cellsA[cellId]
     const b = cellsB[cellId]
     if (!a || !b) continue
@@ -196,8 +202,8 @@ export function splitHalfJsd(
 ): number | null {
   const cellJsds: number[] = []
   for (const samples of samplesByCell.values()) {
-    const even: CountMap = {}
-    const odd: CountMap = {}
+    const even = Object.create(null) as CountMap
+    const odd = Object.create(null) as CountMap
     let evenN = 0
     let oddN = 0
     for (const sample of samples) {

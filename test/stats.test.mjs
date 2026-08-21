@@ -90,6 +90,20 @@ test('buildCellDistribution aggregates categories and entropy', () => {
   assert.equal(dist.meanCompletionTokens, 2)
 })
 
+test('distribution builders treat Object prototype names as ordinary answers', () => {
+  const cellId = 'random-animal:en'
+  const samples = [
+    sample(cellId, 'constructor', 'valid', 0),
+    sample(cellId, 'toString', 'valid', 1),
+    sample(cellId, '__proto__', 'valid', 2),
+  ]
+  const dist = buildCellDistribution(cellId, samples, { kind: 'word' })
+  assert.equal(Object.hasOwn(dist.counts, 'constructor'), true)
+  assert.equal(Object.hasOwn(dist.counts, 'toString'), true)
+  assert.equal(Object.hasOwn(dist.counts, '__proto__'), true)
+  assert.deepEqual(Object.values(dist.counts), [1, 1, 1])
+})
+
 test('compareCellSets: skips thin cells, averages the rest', () => {
   const mk = (counts, validCount) => ({ counts, validCount })
   const a = {

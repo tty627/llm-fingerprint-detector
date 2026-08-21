@@ -51,6 +51,8 @@ test('bundled references: self-compare → 0 distance, cross-model → clearly s
 
 test('unknown bundled id throws with the available list', () => {
   assert.throws(() => loadBundledReference('no/such-model'), /Available:/)
+  assert.throws(() => loadBundledReference('constructor'), /Available:/)
+  assert.throws(() => loadBundledReference('__proto__'), /Available:/)
 })
 
 test('parseFingerprintJson validates structure', () => {

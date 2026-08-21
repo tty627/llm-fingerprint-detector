@@ -183,7 +183,7 @@ export function isCellId(value: string): value is CellId {
   if (idx <= 0) return false
   const task = value.slice(0, idx)
   const lang = value.slice(idx + 1)
-  return task in PROBE_TASKS && (lang === 'en' || lang === 'zh')
+  return Object.hasOwn(PROBE_TASKS, task) && (lang === 'en' || lang === 'zh')
 }
 
 /**

@@ -60,7 +60,7 @@ export function parseChineseNumeral(value: string): number | null {
   let total = 0
   let current = 0
   for (const ch of value) {
-    if (ch in CN_DIGITS) {
+    if (Object.hasOwn(CN_DIGITS, ch)) {
       current = CN_DIGITS[ch]
     } else {
       const unit = CN_UNITS[ch]
@@ -89,13 +89,13 @@ const EN_TENS: Record<string, number> = {
  */
 export function parseEnglishNumberWord(value: string): number | null {
   const word = value.toLowerCase()
-  if (word in EN_ONES) return EN_ONES[word]
-  if (word in EN_TENS) return EN_TENS[word]
+  if (Object.hasOwn(EN_ONES, word)) return EN_ONES[word]
+  if (Object.hasOwn(EN_TENS, word)) return EN_TENS[word]
   if (word === 'hundred' || word === 'onehundred') return 100
   for (const [tens, tensValue] of Object.entries(EN_TENS)) {
     if (word.startsWith(tens)) {
       const rest = word.slice(tens.length)
-      if (rest in EN_ONES && EN_ONES[rest] >= 1 && EN_ONES[rest] <= 9) {
+      if (Object.hasOwn(EN_ONES, rest) && EN_ONES[rest] >= 1 && EN_ONES[rest] <= 9) {
         return tensValue + EN_ONES[rest]
       }
     }
@@ -126,7 +126,7 @@ const EN_COLOR_ALIASES: Record<string, string> = {
 }
 
 function normalizeColorWord(word: string): string {
-  if (EN_COLOR_ALIASES[word]) return EN_COLOR_ALIASES[word]
+  if (Object.hasOwn(EN_COLOR_ALIASES, word)) return EN_COLOR_ALIASES[word]
   // Chinese: 蓝色→蓝, 青色→青 (multi-character names keep their stem; 靛蓝/蔚蓝 unchanged).
   if (/^[\u4e00-\u9fff]{2,}$/.test(word) && word.endsWith('色')) {
     return word.slice(0, -1)
@@ -176,7 +176,9 @@ export function normalizeAnswer(raw: string, domain: AnswerDomain): NormalizedAn
       return { normalized: String(num), category: 'valid' }
     }
     case 'letter': {
-      const mapped = EN_LETTER_NAMES[firstWord] ?? firstWord
+      const mapped = Object.hasOwn(EN_LETTER_NAMES, firstWord)
+        ? EN_LETTER_NAMES[firstWord]
+        : firstWord
       if (/^[a-z]$/.test(mapped)) return { normalized: mapped, category: 'valid' }
       return { normalized: firstWord, category: 'invalid' }
     }
