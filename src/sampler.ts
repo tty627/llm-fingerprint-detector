@@ -145,6 +145,25 @@ export async function runProbeBattery(options: SamplerOptions): Promise<SamplerR
           },
         })
         consecutiveNetworkErrors = 0
+        const apiKey = options.endpoint.apiKey
+        if (apiKey && result.content.includes(apiKey)) {
+          lastErrorKind = 'unknown'
+          lastHttpStatus = null
+          errorCount += 1
+          recordSample({
+            cellId: job.cellId,
+            raw: '',
+            normalized: null,
+            category: 'error',
+            latencyMs: result.latencyMs,
+            usage: null,
+            arrivalIndex: arrivalIndex++,
+            errorMessage: 'Response excluded because it echoed a request credential',
+            errorKind: 'unknown',
+            httpStatus: null,
+          })
+          continue
+        }
         const domain = getTaskSpec(job.cellId).domain
         const { normalized, category } = normalizeAnswer(result.content, domain)
         recordSample({

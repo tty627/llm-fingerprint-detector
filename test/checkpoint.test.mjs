@@ -114,6 +114,43 @@ test('checkpoint is rewritten after every sample and a partial cannot produce a 
   }
 })
 
+test('credential echoes are excluded before legacy answer normalization and checkpointing', async () => {
+  const secret = 'forty-seven'
+  const server = createServer((request, response) => {
+    request.resume()
+    request.on('end', () => completion(response, secret))
+  })
+  const baseUrl = await listen(server)
+  const checkpoints = []
+
+  try {
+    const run = await fingerprint(
+      { baseUrl, model: 'credential-echo-model', apiKey: secret },
+      {
+        adapter: FIXED_ADAPTER,
+        cells: ['random-number-1-100:en'],
+        samplesPerCell: 2,
+        concurrency: 1,
+        keepSamples: true,
+        onCheckpoint: (checkpoint) => checkpoints.push(structuredClone(checkpoint)),
+      },
+    )
+
+    const cell = run.fingerprint.cells['random-number-1-100:en']
+    assert.equal(run.errorCount, 2)
+    assert.equal(cell.validCount, 0)
+    assert.equal(cell.errorCount, 2)
+    assert.deepEqual(cell.counts, {})
+    assert.equal(Object.hasOwn(cell.counts, '47'), false)
+    assert.equal(run.samples.length, 2)
+    assert.ok(run.samples.every((sample) => sample.category === 'error'))
+    assert.ok(run.samples.every((sample) => sample.raw === '' && sample.normalized === null))
+    assert.equal(JSON.stringify({ run, checkpoints }).includes(secret), false)
+  } finally {
+    await closeServer(server)
+  }
+})
+
 test('Retry-After is capped and its wait remains abortable', async () => {
   assert.equal(MAX_RETRY_DELAY_MS, 60_000)
   assert.equal(retryDelayMs('3600', 0, 0), MAX_RETRY_DELAY_MS)
