@@ -153,6 +153,115 @@ test('paper-fingerprint CLI writes V2 + SHA-bound JSONL without leaking headers 
   }
 })
 
+test('paper-fingerprint emits per-sample progress and retains SHA-bound partials on SIGTERM', async () => {
+  let requests = 0
+  const server = createServer((request, response) => {
+    request.resume()
+    request.on('end', () => {
+      requests += 1
+      if (requests !== 1) return
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(
+        JSON.stringify({
+          model: 'paper-progress-model',
+          choices: [{ message: { role: 'assistant', content: '7' }, finish_reason: 'stop' }],
+          usage: {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            completion_tokens_details: { reasoning_tokens: 0 },
+          },
+        }),
+      )
+    })
+  })
+  const tempDir = await mkdtemp(join(tmpdir(), 'llm-paper-partial-'))
+  const fingerprintPath = join(tempDir, 'audit.partial.json')
+  const samplesPath = join(tempDir, 'audit.partial.jsonl')
+  const secret = 'paper-partial-key-must-not-leak'
+  let child
+
+  try {
+    const baseUrl = await listen(server)
+    child = spawn(
+      process.execPath,
+      [
+        CLI_PATH,
+        'paper-fingerprint',
+        '--base-url', baseUrl,
+        '--model', 'paper-progress-model',
+        '--api-key-env', 'PAPER_PARTIAL_TEST_KEY',
+        '--role', 'audit',
+        '--scheduler-seed', 'partial-seed',
+        '--samples', '1',
+        '--concurrency', '1',
+        '--timeout', '10000',
+        '--out', fingerprintPath,
+        '--samples-out', samplesPath,
+        '--json',
+      ],
+      {
+        env: { ...process.env, PAPER_PARTIAL_TEST_KEY: secret },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    )
+    const stdout = []
+    const stderr = []
+    child.stdout.on('data', (chunk) => stdout.push(chunk))
+    let pendingStderr = ''
+    const sawFirstSample = new Promise((resolve) => {
+      child.stderr.on('data', (chunk) => {
+        stderr.push(chunk)
+        pendingStderr += chunk.toString('utf8')
+        const lines = pendingStderr.split('\n')
+        pendingStderr = lines.pop() ?? ''
+        for (const line of lines) {
+          if (!line.startsWith('LLMFP_PROGRESS ')) continue
+          const event = JSON.parse(line.slice('LLMFP_PROGRESS '.length))
+          if (event.stage === 'sampling' && event.done === 1 && event.retrying === false) {
+            resolve()
+          }
+        }
+      })
+    })
+
+    await Promise.race([
+      sawFirstSample,
+      new Promise((_, reject) => {
+        const timer = setTimeout(() => reject(new Error('no paper progress')), 5_000)
+        timer.unref()
+      }),
+    ])
+    child.kill('SIGTERM')
+    const [code, signal] = await once(child, 'close')
+    const stdoutText = Buffer.concat(stdout).toString('utf8')
+    const stderrText = Buffer.concat(stderr).toString('utf8')
+    const fingerprintText = await readFile(fingerprintPath, 'utf8')
+    const samplesText = await readFile(samplesPath, 'utf8')
+    const fingerprint = JSON.parse(fingerprintText)
+
+    assert.equal(code, 1)
+    assert.equal(signal, null)
+    assert.equal(fingerprint.partial, true)
+    assert.equal(fingerprint.completedSamples, 1)
+    assert.equal(fingerprint.expectedSamples, 40)
+    assert.equal(fingerprint.incompleteReason, 'sampling_interrupted')
+    assert.equal(samplesText.trimEnd().split('\n').length, 1)
+    assert.equal(
+      fingerprint.quality.rawEvidenceSha256,
+      createHash('sha256').update(samplesText, 'utf8').digest('hex'),
+    )
+    assert.match(stderrText, /"stage":"sampling","done":1,"total":40/)
+    assert.match(stderrText, /partial evidence retained after SIGTERM: 1\/40/)
+    for (const persisted of [fingerprintText, samplesText, stdoutText, stderrText]) {
+      assert.equal(persisted.includes(secret), false)
+    }
+  } finally {
+    if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    await closeServer(server)
+    await rm(tempDir, { recursive: true, force: true })
+  }
+})
+
 test('paper-fingerprint is explicit, requires collection metadata, and documents default 30', () => {
   const help = spawnSync(process.execPath, [CLI_PATH, '--help'], { encoding: 'utf8' })
   assert.equal(help.status, 0, help.stderr)

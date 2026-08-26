@@ -38,6 +38,7 @@ import {
   parseFingerprintJson,
 } from './reference.js'
 import {
+  PaperCollectionRequestError,
   collectBruckner2026PaperFingerprint,
   paperSplitHalfByRepetitionIndex,
   type PaperCollectionResult,
@@ -50,7 +51,6 @@ import type {
   Endpoint,
   Fingerprint,
   FingerprintOptions,
-  ProgressEvent,
   VerdictLevel,
 } from './types.js'
 
@@ -368,7 +368,19 @@ function readPaperCliOptions(args: ParsedArgs): PaperCliOptions {
   }
 }
 
-function makeProgressRenderer(args: ParsedArgs): ((event: ProgressEvent) => void) | undefined {
+interface CliProgressEvent {
+  stage: 'adapter' | 'sampling'
+  done: number
+  total: number
+  errors: number
+  strategy?: string
+  detail?: string | null
+  lastErrorKind?: string | null
+  lastHttpStatus?: number | null
+  retrying?: boolean
+}
+
+function makeProgressRenderer(args: ParsedArgs): ((event: CliProgressEvent) => void) | undefined {
   if (args.options.get('--quiet')) return undefined
   const isTty = process.stderr.isTTY === true
   return (event) => {
@@ -796,12 +808,40 @@ async function cmdPaperFingerprint(args: ParsedArgs): Promise<number> {
     )
   }
 
+  const abortController = new AbortController()
+  let interruptedSignal: NodeJS.Signals | null = null
+  const interrupt = (signal: NodeJS.Signals): void => {
+    interruptedSignal = signal
+    abortController.abort()
+  }
+  const onSigterm = (): void => interrupt('SIGTERM')
+  const onSigint = (): void => interrupt('SIGINT')
+  process.once('SIGTERM', onSigterm)
+  process.once('SIGINT', onSigint)
+
+  const renderProgress = makeProgressRenderer(args)
+  let lastCheckpoint: PaperCollectionResult | null = null
+  let completedSamples = 0
+  let errorSamples = 0
   let result: PaperCollectionResult
   try {
     const request = createOpenAICompatiblePaperTransport({
       baseUrl: endpoint.baseUrl,
       apiKey: endpoint.apiKey,
       timeoutMs: paper.timeoutMs,
+      signal: abortController.signal,
+      onRetry: (event) => {
+        renderProgress?.({
+          stage: 'sampling',
+          done: completedSamples,
+          total: plannedRequests,
+          errors: errorSamples,
+          detail: 'retry_wait',
+          lastErrorKind: event.kind,
+          lastHttpStatus: event.status,
+          retrying: true,
+        })
+      },
     })
     result = await collectBruckner2026PaperFingerprint({
       model: endpoint.model,
@@ -812,11 +852,40 @@ async function cmdPaperFingerprint(args: ParsedArgs): Promise<number> {
       request,
       abortOnRequestError: true,
       abortOnProviderError: true,
+      signal: abortController.signal,
+      onCheckpoint: (checkpoint) => {
+        lastCheckpoint = checkpoint
+      },
+      onProgress: (event) => {
+        completedSamples = event.done
+        errorSamples = event.errors
+        renderProgress?.(event)
+      },
     })
     writePaperOutputsAtomic(preparedOutputs, result)
   } catch (error) {
-    abortPaperOutputs(preparedOutputs)
+    const retained = lastCheckpoint as PaperCollectionResult | null
+    if (
+      interruptedSignal !== null
+      && error instanceof PaperCollectionRequestError
+      && error.kind === 'aborted'
+      && retained !== null
+      && retained.fingerprint.partial === true
+      && retained.fingerprint.quality.completedSamples > 0
+    ) {
+      retained.fingerprint.incompleteReason = 'sampling_interrupted'
+      writePaperOutputsAtomic(preparedOutputs, retained)
+      process.stderr.write(
+        `paper-profile partial evidence retained after ${interruptedSignal}: ` +
+          `${retained.fingerprint.quality.completedSamples}/${plannedRequests}\n`,
+      )
+    } else {
+      abortPaperOutputs(preparedOutputs)
+    }
     throw error
+  } finally {
+    process.off('SIGTERM', onSigterm)
+    process.off('SIGINT', onSigint)
   }
   process.stderr.write(`paper-profile V2 fingerprint written to ${paper.out}\n`)
   process.stderr.write(`canonical raw evidence written to ${paper.samplesOut}\n`)
