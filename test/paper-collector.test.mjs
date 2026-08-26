@@ -129,6 +129,88 @@ test('direct request body is exact and never adds top_p, seed, or fallback token
   assert.equal(JSON.stringify(body).includes('1024'), false)
 })
 
+test('paper collector checkpoints precede progress and remain SHA-bound', async () => {
+  const checkpoints = []
+  const callbackOrder = []
+  const result = await collectBruckner2026PaperFingerprint(
+    baseOptions(async (_body, context) => cleanResponse(context.job), {
+      concurrency: 1,
+      onCheckpoint: (checkpoint) => {
+        const retained = structuredClone(checkpoint)
+        checkpoints.push(retained)
+        callbackOrder.push(
+          `checkpoint:${retained.fingerprint.quality.completedSamples}:`
+          + (retained.fingerprint.partial === true ? 'partial' : 'complete'),
+        )
+      },
+      onProgress: (event) => {
+        callbackOrder.push(`progress:${event.done}`)
+      },
+    }),
+  )
+
+  assert.equal(checkpoints.length, 42, 'initial + one per sample + final')
+  assert.deepEqual(
+    checkpoints.map((checkpoint) => checkpoint.fingerprint.quality.completedSamples),
+    [0, ...Array.from({ length: 40 }, (_, index) => index + 1), 40],
+  )
+  assert.ok(checkpoints.slice(0, -2).every(
+    (checkpoint) => checkpoint.fingerprint.partial === true,
+  ))
+  assert.ok(checkpoints.slice(-2).every(
+    (checkpoint) => checkpoint.fingerprint.partial === undefined,
+  ))
+  for (const checkpoint of checkpoints) {
+    assert.equal(
+      checkpoint.fingerprint.quality.rawEvidenceSha256,
+      hashPaperRawEvidence(checkpoint.evidence),
+    )
+  }
+  for (let done = 1; done <= 40; done += 1) {
+    const offset = 1 + ((done - 1) * 2)
+    const completion = done === 40 ? 'complete' : 'partial'
+    assert.equal(callbackOrder[offset], `checkpoint:${done}:${completion}`)
+    assert.equal(callbackOrder[offset + 1], `progress:${done}`)
+  }
+  assert.equal(callbackOrder.at(-1), 'checkpoint:40:complete')
+  assert.deepEqual(checkpoints.at(-1), result)
+})
+
+test('paper collector AbortSignal emits a sampling_interrupted partial checkpoint', async () => {
+  const controller = new AbortController()
+  const checkpoints = []
+
+  await assert.rejects(
+    collectBruckner2026PaperFingerprint(
+      baseOptions(async (_body, context) => cleanResponse(context.job), {
+        concurrency: 1,
+        signal: controller.signal,
+        onCheckpoint: (checkpoint) => checkpoints.push(structuredClone(checkpoint)),
+        onProgress: (event) => {
+          if (event.done === 1) controller.abort()
+        },
+      }),
+    ),
+    (error) => error instanceof PaperCollectionRequestError && error.kind === 'aborted',
+  )
+
+  assert.equal(checkpoints.length, 3, 'initial + first sample + interrupted')
+  const interrupted = checkpoints.at(-1)
+  assert.equal(interrupted.fingerprint.partial, true)
+  assert.equal(interrupted.fingerprint.incompleteReason, 'sampling_interrupted')
+  assert.equal(interrupted.fingerprint.quality.complete, false)
+  assert.equal(interrupted.fingerprint.quality.completedSamples, 1)
+  assert.equal(interrupted.fingerprint.quality.expectedSamples, 40)
+  assert.equal(
+    interrupted.fingerprint.quality.rawEvidenceSha256,
+    hashPaperRawEvidence(interrupted.evidence),
+  )
+  assert.throws(
+    () => validateFingerprint(interrupted.fingerprint, { rejectPartial: true }),
+    /incomplete partial fingerprint/i,
+  )
+})
+
 test('concurrency and deliberately out-of-order completion do not change jobs or artifact', async () => {
   const expectedJobs = createBruckner2026CollectionJobs(2, 'offline-seed-2026')
   const firstJobId = expectedJobs[0].jobId
