@@ -44,6 +44,8 @@ import {
 } from './paper-collector.js'
 import {
   ANTHROPIC_MESSAGES_OPUS5_TRANSPORT_PROFILE,
+  BRUCKNER_2026_HTTP_RETRY_BUDGET,
+  BRUCKNER_2026_HTTP_TIMEOUT_MS,
   createAnthropicMessagesOpus5Transport,
   createOpenAICompatiblePaperTransport,
 } from './paper-http.js'
@@ -166,7 +168,7 @@ SAMPLING OPTIONS
   --preset <id>         quick (4×15) | standard (8×25) | strict (16×25)
   --concurrency <n>     Concurrent requests (default: ${DEFAULT_CONCURRENCY})
   --timeout <ms>        Per-request timeout (legacy default: 30000;
-                        paper-fingerprint default: 90000)
+                        paper-fingerprint default/max: 30000)
 
 PAPER-FINGERPRINT (EXPLICIT OPT-IN)
   --role <kind>         Required: enrollment | audit
@@ -180,7 +182,7 @@ PAPER-FINGERPRINT (EXPLICIT OPT-IN)
                         anthropic-messages-opus5-onetoken-v1
   --anthropic-workspace-id <id>
                         Optional Anthropic workspace header; Anthropic only
-  --retry-budget <n>    Batch-wide extra-attempt budget (default: 240)
+  --retry-budget <n>    Batch-wide extra-attempt budget (default/max: 240)
   This sends the pinned fixed prompts at T=1 and max_tokens=16. It is not a
   full reproduction of the paper's EER evaluation, has no validated decision
   policy, and does not produce a model-identity conclusion. Auth failures are
@@ -371,9 +373,15 @@ function readPaperCliOptions(args: ParsedArgs): PaperCliOptions {
     fail('--concurrency must be a positive integer')
   }
   const timeoutValue = args.options.get('--timeout')
-  const timeoutMs = typeof timeoutValue === 'string' ? Number(timeoutValue) : 90_000
-  if (!Number.isFinite(timeoutMs) || timeoutMs < 100) {
-    fail('--timeout must be ≥ 100 (milliseconds)')
+  const timeoutMs = typeof timeoutValue === 'string'
+    ? Number(timeoutValue)
+    : BRUCKNER_2026_HTTP_TIMEOUT_MS
+  if (
+    !Number.isFinite(timeoutMs)
+    || timeoutMs < 100
+    || timeoutMs > BRUCKNER_2026_HTTP_TIMEOUT_MS
+  ) {
+    fail(`--timeout must be 100-${BRUCKNER_2026_HTTP_TIMEOUT_MS} milliseconds`)
   }
   const requestedProfile = args.options.get('--transport-profile')
   const transportProfileId = requestedProfile === undefined
@@ -405,9 +413,15 @@ function readPaperCliOptions(args: ParsedArgs): PaperCliOptions {
     }
   }
   const retryBudgetValue = args.options.get('--retry-budget')
-  const retryBudget = typeof retryBudgetValue === 'string' ? Number(retryBudgetValue) : 240
-  if (!Number.isSafeInteger(retryBudget) || retryBudget < 0) {
-    fail('--retry-budget must be a non-negative integer')
+  const retryBudget = typeof retryBudgetValue === 'string'
+    ? Number(retryBudgetValue)
+    : BRUCKNER_2026_HTTP_RETRY_BUDGET
+  if (
+    !Number.isSafeInteger(retryBudget)
+    || retryBudget < 0
+    || retryBudget > BRUCKNER_2026_HTTP_RETRY_BUDGET
+  ) {
+    fail(`--retry-budget must be an integer from 0 to ${BRUCKNER_2026_HTTP_RETRY_BUDGET}`)
   }
   return {
     role,
@@ -433,6 +447,9 @@ interface CliProgressEvent {
   lastErrorKind?: string | null
   lastHttpStatus?: number | null
   retrying?: boolean
+  attemptCount?: number
+  retryCount?: number
+  retryBudgetUsed?: number
 }
 
 function makeProgressRenderer(args: ParsedArgs): ((event: CliProgressEvent) => void) | undefined {
@@ -455,6 +472,15 @@ function makeProgressRenderer(args: ParsedArgs): ((event: CliProgressEvent) => v
           lastErrorKind: event.lastErrorKind ?? null,
           lastHttpStatus: event.lastHttpStatus ?? null,
           retrying: event.retrying === true,
+          ...(event.attemptCount === undefined
+            ? {}
+            : { attemptCount: event.attemptCount }),
+          ...(event.retryCount === undefined
+            ? {}
+            : { retryCount: event.retryCount }),
+          ...(event.retryBudgetUsed === undefined
+            ? {}
+            : { retryBudgetUsed: event.retryBudgetUsed }),
         })}\n`,
       )
       return
@@ -890,9 +916,31 @@ async function cmdPaperFingerprint(args: ParsedArgs): Promise<number> {
       allowInsecureLoopbackForTests:
         process.env.LLMFP_ALLOW_INSECURE_LOOPBACK_FOR_TESTS === '1',
       signal: abortController.signal,
+      onAttempt: (event: {
+        attemptCount: number
+        retryCount: number
+        retryBudgetUsed: number
+      }) => {
+        renderProgress?.({
+          stage: 'sampling',
+          done: completedSamples,
+          total: plannedRequests,
+          errors: errorSamples,
+          detail: 'request_attempt',
+          lastErrorKind: null,
+          lastHttpStatus: null,
+          retrying: false,
+          attemptCount: event.attemptCount,
+          retryCount: event.retryCount,
+          retryBudgetUsed: event.retryBudgetUsed,
+        })
+      },
       onRetry: (event: {
         kind: string
         status: number | null
+        attemptCount: number
+        retryCount: number
+        retryBudgetUsed: number
       }) => {
         renderProgress?.({
           stage: 'sampling',
@@ -903,6 +951,9 @@ async function cmdPaperFingerprint(args: ParsedArgs): Promise<number> {
           lastErrorKind: event.kind,
           lastHttpStatus: event.status,
           retrying: true,
+          attemptCount: event.attemptCount,
+          retryCount: event.retryCount,
+          retryBudgetUsed: event.retryBudgetUsed,
         })
       },
     }

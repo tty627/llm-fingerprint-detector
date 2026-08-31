@@ -8,6 +8,11 @@ import {
   PaperHttpRequestError,
   createOpenAICompatiblePaperTransport,
 } from '../dist/paper.js'
+import {
+  buildBruckner2026DirectRequest,
+  collectBruckner2026PaperFingerprint,
+  createBruckner2026CollectionJobs,
+} from '../dist/paper-collector.js'
 import * as rootApi from '../dist/index.js'
 
 const BODY = {
@@ -23,9 +28,47 @@ const BODY = {
 }
 
 test('paper HTTP defaults pin timeout and the two-retry safety bound', () => {
-  assert.equal(BRUCKNER_2026_HTTP_TIMEOUT_MS, 90_000)
+  assert.equal(BRUCKNER_2026_HTTP_TIMEOUT_MS, 30_000)
   assert.equal(BRUCKNER_2026_HTTP_RETRIES, 2)
-  assert.equal(BRUCKNER_2026_HTTP_MAX_RESPONSE_BYTES, 1024 * 1024)
+  assert.equal(BRUCKNER_2026_HTTP_MAX_RESPONSE_BYTES, 64 * 1024)
+  assert.throws(
+    () => createOpenAICompatiblePaperTransport({
+      baseUrl: 'https://paper.invalid/v1',
+      timeoutMs: 30_001,
+      fetchImpl: async () => { throw new Error('must not fetch') },
+    }),
+    /timeoutMs must not exceed 30000/,
+  )
+})
+
+test('paper HTTP retry budget is hard-capped and exponential retries include bounded jitter', async () => {
+  assert.throws(
+    () => createOpenAICompatiblePaperTransport({
+      baseUrl: 'https://paper.invalid/v1',
+      retryBudget: 241,
+      fetchImpl: async () => { throw new Error('must not fetch') },
+    }),
+    /retryBudget must not exceed 240/,
+  )
+
+  const delays = []
+  let calls = 0
+  const request = createOpenAICompatiblePaperTransport({
+    baseUrl: 'https://paper.invalid/v1',
+    retries: 1,
+    retryBudget: 1,
+    jitterRandom: () => 0.5,
+    delay: async (milliseconds) => delays.push(milliseconds),
+    fetchImpl: async () => {
+      calls += 1
+      if (calls === 1) throw new Error('unreachable fixture')
+      return new Response(JSON.stringify({ choices: [{ message: { content: '7' } }] }), {
+        status: 200,
+      })
+    },
+  })
+  await request(BODY, { role: 'audit', schedulerSeed: 'seed', job: {} })
+  assert.deepEqual(delays, [525])
 })
 
 test('paper HTTP transport sends the collector body unchanged and key only as Authorization', async () => {
@@ -95,17 +138,114 @@ test('paper HTTP transport sends the collector body unchanged and key only as Au
   })
 })
 
+test('OpenAI strict transport validates all canonical40 40x30 requests without fallback', async () => {
+  const model = 'openai-mock-model'
+  const schedulerSeed = 'openai-canonical40-1200'
+  const mockKey = 'mock-openai-key-never-real'
+  const expectedBodies = new Map()
+  for (const job of createBruckner2026CollectionJobs(30, schedulerSeed)) {
+    const serialized = JSON.stringify(buildBruckner2026DirectRequest(model, job))
+    expectedBodies.set(serialized, (expectedBodies.get(serialized) ?? 0) + 1)
+  }
+  const observed = []
+  const request = createOpenAICompatiblePaperTransport({
+    baseUrl: 'https://openai.mock.invalid/v1',
+    apiKey: mockKey,
+    headers: {
+      'X-Mock-Tenant': 'strict-1200',
+      authorization: 'Bearer caller-value-must-be-ignored',
+      'content-TYPE': 'text/plain',
+    },
+    retries: 0,
+    fetchImpl: async (url, init) => {
+      observed.push({
+        url,
+        method: init.method,
+        redirect: init.redirect,
+        headers: { ...init.headers },
+        body: init.body,
+      })
+      return new Response(JSON.stringify({
+        id: `mock-${observed.length}`,
+        model: 'openai-mock-reported',
+        choices: [{
+          message: { role: 'assistant', content: '7', reasoning: 'mock-internal-trace' },
+          finish_reason: 'stop',
+        }],
+        usage: {
+          prompt_tokens: 12,
+          completion_tokens: 1,
+          completion_tokens_details: { reasoning_tokens: 0 },
+        },
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    },
+  })
+
+  const collected = await collectBruckner2026PaperFingerprint({
+    model,
+    transportProfileId: 'openai-chat-onetoken-v1',
+    role: 'audit',
+    samplesPerCell: 30,
+    schedulerSeed,
+    concurrency: 3,
+    request,
+  })
+
+  assert.equal(observed.length, 1_200)
+  for (const item of observed) {
+    assert.equal(item.url, 'https://openai.mock.invalid/v1/chat/completions')
+    assert.equal(item.method, 'POST')
+    assert.equal(item.redirect, 'error')
+    assert.deepEqual(item.headers, {
+      'X-Mock-Tenant': 'strict-1200',
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${mockKey}`,
+    })
+    assert.equal(typeof item.body, 'string')
+    const remaining = expectedBodies.get(item.body) ?? 0
+    assert.ok(remaining > 0, 'every wire body must be one exact frozen canonical40 request')
+    expectedBodies.set(item.body, remaining - 1)
+    const body = JSON.parse(item.body)
+    assert.deepEqual(Object.keys(body), [
+      'model',
+      'messages',
+      'temperature',
+      'max_tokens',
+      'reasoning',
+      'usage',
+    ])
+    for (const forbidden of ['top_p', 'top_k', 'tools', 'seed', 'stream']) {
+      assert.equal(Object.hasOwn(body, forbidden), false)
+    }
+  }
+  assert.ok([...expectedBodies.values()].every((remaining) => remaining === 0))
+  assert.deepEqual(request.getTransportMetrics(), {
+    attemptCount: 1_200,
+    retryCount: 0,
+    retryBudgetUsed: 0,
+  })
+  assert.equal(collected.fingerprint.quality.complete, true)
+  assert.equal(collected.fingerprint.quality.attemptCount, 1_200)
+  assert.equal(collected.fingerprint.quality.retryCount, 0)
+  assert.equal(collected.fingerprint.quality.reasoningTraceCount, 1_200)
+  assert.equal(collected.fingerprint.quality.directness, 'violated')
+})
+
 test('paper HTTP transport retries 429/5xx through injectable delay', async () => {
   let calls = 0
   const delays = []
   const retryEvents = []
+  const attemptEvents = []
+  const bodies = []
   const request = createOpenAICompatiblePaperTransport({
     baseUrl: 'https://paper.invalid/v1',
     retries: 1,
     delay: async (milliseconds) => delays.push(milliseconds),
     onRetry: (event) => retryEvents.push(event),
-    fetchImpl: async () => {
+    onAttempt: (event) => attemptEvents.push(event),
+    fetchImpl: async (_url, init) => {
       calls += 1
+      bodies.push(JSON.parse(init.body))
       if (calls === 1) {
         return new Response('provider-secret-error-body', {
           status: 503,
@@ -123,9 +263,126 @@ test('paper HTTP transport retries 429/5xx through injectable delay', async () =
   assert.equal(calls, 2)
   assert.deepEqual(delays, [1])
   assert.deepEqual(retryEvents, [
-    { attempt: 2, maxRetries: 1, kind: 'http', status: 503, delayMs: 1 },
+    {
+      attempt: 2,
+      maxRetries: 1,
+      kind: 'http',
+      status: 503,
+      delayMs: 1,
+      attemptCount: 1,
+      retryCount: 0,
+      retryBudgetUsed: 1,
+    },
   ])
+  assert.deepEqual(attemptEvents, [
+    { attempt: 1, attemptCount: 1, retryCount: 0, retryBudgetUsed: 0 },
+    { attempt: 2, attemptCount: 2, retryCount: 1, retryBudgetUsed: 1 },
+  ])
+  assert.deepEqual(bodies, [BODY, BODY])
   assert.equal(result.response.choices[0].message.content, 'blue')
+})
+
+test('concurrent requests share the retry budget without oversubscription and emit monotonic counters', async () => {
+  const initialResolvers = []
+  const events = []
+  let fetchCalls = 0
+  const request = createOpenAICompatiblePaperTransport({
+    baseUrl: 'https://paper.invalid/v1',
+    retries: 1,
+    retryBudget: 2,
+    delay: async () => {},
+    onAttempt: (event) => events.push({ type: 'attempt', ...event }),
+    onRetry: (event) => events.push({ type: 'retry', ...event }),
+    fetchImpl: async () => {
+      fetchCalls += 1
+      if (fetchCalls <= 4) {
+        return await new Promise((resolve) => initialResolvers.push(resolve))
+      }
+      return new Response(JSON.stringify({ choices: [{ message: { content: '7' } }] }), {
+        status: 200,
+      })
+    },
+  })
+
+  const pending = Array.from(
+    { length: 4 },
+    () => request(BODY, { role: 'audit', schedulerSeed: 'seed', job: {} }),
+  )
+  while (initialResolvers.length < 4) await new Promise((resolve) => setImmediate(resolve))
+  for (const resolve of initialResolvers) resolve(new Response(null, { status: 503 }))
+  const settled = await Promise.allSettled(pending)
+
+  assert.equal(settled.filter((result) => result.status === 'fulfilled').length, 2)
+  const rejected = settled.filter((result) => result.status === 'rejected')
+  assert.equal(rejected.length, 2)
+  assert.ok(rejected.every(
+    (result) => result.reason instanceof PaperHttpRequestError
+      && result.reason.kind === 'retry_budget_exhausted',
+  ))
+  assert.equal(fetchCalls, 6)
+  assert.deepEqual(request.getTransportMetrics(), {
+    attemptCount: 6,
+    retryCount: 2,
+    retryBudgetUsed: 2,
+  })
+  assert.equal(events.filter((event) => event.type === 'retry').length, 2)
+  for (let index = 1; index < events.length; index += 1) {
+    assert.ok(events[index].attemptCount >= events[index - 1].attemptCount)
+    assert.ok(events[index].retryCount >= events[index - 1].retryCount)
+    assert.ok(events[index].retryBudgetUsed >= events[index - 1].retryBudgetUsed)
+  }
+})
+
+test('cancelling during retry cooldown consumes the reservation without inventing a physical retry', async () => {
+  const controller = new AbortController()
+  const events = []
+  let fetchCalls = 0
+  const request = createOpenAICompatiblePaperTransport({
+    baseUrl: 'https://paper.invalid/v1',
+    retries: 1,
+    retryBudget: 1,
+    signal: controller.signal,
+    onAttempt: (event) => events.push({ type: 'attempt', ...event }),
+    onRetry: (event) => {
+      events.push({ type: 'retry', ...event })
+      controller.abort()
+    },
+    fetchImpl: async () => {
+      fetchCalls += 1
+      return new Response(null, { status: 429, headers: { 'retry-after': '60' } })
+    },
+  })
+
+  await assert.rejects(
+    request(BODY, { role: 'audit', schedulerSeed: 'seed', job: {} }),
+    (error) => error instanceof PaperHttpRequestError && error.kind === 'aborted',
+  )
+  assert.equal(fetchCalls, 1)
+  assert.deepEqual(events, [
+    {
+      type: 'attempt',
+      attempt: 1,
+      attemptCount: 1,
+      retryCount: 0,
+      retryBudgetUsed: 0,
+    },
+    {
+      type: 'retry',
+      attempt: 2,
+      maxRetries: 1,
+      kind: 'http',
+      status: 429,
+      delayMs: 60_000,
+      attemptCount: 1,
+      retryCount: 0,
+      retryBudgetUsed: 1,
+    },
+  ])
+  assert.deepEqual(request.getTransportMetrics(), {
+    attemptCount: 1,
+    retryCount: 0,
+    retryBudgetUsed: 1,
+  })
 })
 
 test('paper HTTP transport cancels non-success bodies before returning a safe error', async () => {

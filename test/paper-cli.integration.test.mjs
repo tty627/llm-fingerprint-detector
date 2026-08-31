@@ -354,6 +354,31 @@ test('paper-fingerprint CLI selects the strict Anthropic profile and binds it in
     const samplesText = await readFile(samplesPath, 'utf8')
     const fingerprint = JSON.parse(fingerprintText)
     const summary = JSON.parse(stdoutText)
+    const progressEvents = stderrText
+      .split('\n')
+      .filter((line) => line.startsWith('LLMFP_PROGRESS '))
+      .map((line) => JSON.parse(line.slice('LLMFP_PROGRESS '.length)))
+    assert.ok(progressEvents.length >= 80)
+    for (const event of progressEvents) {
+      assert.equal(Number.isSafeInteger(event.attemptCount), true)
+      assert.equal(Number.isSafeInteger(event.retryCount), true)
+      assert.equal(Number.isSafeInteger(event.retryBudgetUsed), true)
+    }
+    for (let index = 1; index < progressEvents.length; index += 1) {
+      assert.ok(progressEvents[index].attemptCount >= progressEvents[index - 1].attemptCount)
+      assert.ok(progressEvents[index].retryCount >= progressEvents[index - 1].retryCount)
+      assert.ok(
+        progressEvents[index].retryBudgetUsed >= progressEvents[index - 1].retryBudgetUsed,
+      )
+    }
+    assert.deepEqual(
+      {
+        attemptCount: progressEvents.at(-1).attemptCount,
+        retryCount: progressEvents.at(-1).retryCount,
+        retryBudgetUsed: progressEvents.at(-1).retryBudgetUsed,
+      },
+      { attemptCount: 40, retryCount: 0, retryBudgetUsed: 0 },
+    )
     assert.equal(
       fingerprint.manifest.transportProfileId,
       'anthropic-messages-opus5-onetoken-v1',
@@ -378,6 +403,8 @@ test('paper-fingerprint is explicit, requires collection metadata, and documents
   assert.match(help.stdout, /paper-fingerprint/)
   assert.match(help.stdout, /exact T=1 Study-A 40-cell collection profile/)
   assert.match(help.stdout, /Samples per each of 40 cells \(default: 30\)/)
+  assert.match(help.stdout, /paper-fingerprint default\/max: 30000/)
+  assert.match(help.stdout, /Batch-wide extra-attempt budget \(default\/max: 240\)/)
   assert.match(help.stdout, /not a\n  full reproduction of the paper's EER evaluation/)
   assert.match(help.stdout, /does not produce a model-identity conclusion/)
 
