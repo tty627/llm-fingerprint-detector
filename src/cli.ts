@@ -42,7 +42,11 @@ import {
   paperSplitHalfByRepetitionIndex,
   type PaperCollectionResult,
 } from './paper-collector.js'
-import { createOpenAICompatiblePaperTransport } from './paper-http.js'
+import {
+  ANTHROPIC_MESSAGES_OPUS5_TRANSPORT_PROFILE,
+  createAnthropicMessagesOpus5Transport,
+  createOpenAICompatiblePaperTransport,
+} from './paper-http.js'
 import { ProbeRunError } from './sampler.js'
 import type {
   CellId,
@@ -50,11 +54,11 @@ import type {
   Endpoint,
   Fingerprint,
   FingerprintOptions,
-  ProgressEvent,
   VerdictLevel,
 } from './types.js'
 
 const DEFAULT_KEY_ENV_VARS = ['LLM_FINGERPRINT_API_KEY', 'OPENAI_API_KEY']
+const OPENAI_CHAT_TRANSPORT_PROFILE = 'openai-chat-onetoken-v1' as const
 
 const VALUE_OPTIONS = new Set([
   '--base-url',
@@ -71,6 +75,9 @@ const VALUE_OPTIONS = new Set([
   '--role',
   '--scheduler-seed',
   '--samples-out',
+  '--transport-profile',
+  '--anthropic-workspace-id',
+  '--retry-budget',
 ])
 const BOOLEAN_OPTIONS = new Set(['--json', '--quiet', '--help', '-h', '--version', '-V'])
 
@@ -168,10 +175,16 @@ PAPER-FINGERPRINT (EXPLICIT OPT-IN)
   --samples-out <file>  Required canonical raw-evidence JSONL sidecar
   --samples <n>         Samples per each of 40 cells (default: 30)
   --concurrency <n>     Concurrent requests (default: ${DEFAULT_CONCURRENCY})
+  --transport-profile <id>
+                        openai-chat-onetoken-v1 (default) |
+                        anthropic-messages-opus5-onetoken-v1
+  --anthropic-workspace-id <id>
+                        Optional Anthropic workspace header; Anthropic only
+  --retry-budget <n>    Batch-wide extra-attempt budget (default: 240)
   This sends the pinned fixed prompts at T=1 and max_tokens=16. It is not a
   full reproduction of the paper's EER evaluation, has no validated decision
   policy, and does not produce a model-identity conclusion. Auth failures are
-  not retried; network/timeout failures get 5 retries per in-flight job. This
+  not retried; network/timeout/429/selected 5xx get at most 2 retries. This
   command uses environment-sourced keys when authentication is needed and
   rejects literal keys.
 
@@ -315,6 +328,11 @@ interface PaperCliOptions {
   samplesPerCell: number
   concurrency: number
   timeoutMs: number
+  transportProfileId:
+    | typeof OPENAI_CHAT_TRANSPORT_PROFILE
+    | typeof ANTHROPIC_MESSAGES_OPUS5_TRANSPORT_PROFILE
+  anthropicWorkspaceId: string | null
+  retryBudget: number
 }
 
 function readPaperCliOptions(args: ParsedArgs): PaperCliOptions {
@@ -357,6 +375,40 @@ function readPaperCliOptions(args: ParsedArgs): PaperCliOptions {
   if (!Number.isFinite(timeoutMs) || timeoutMs < 100) {
     fail('--timeout must be ≥ 100 (milliseconds)')
   }
+  const requestedProfile = args.options.get('--transport-profile')
+  const transportProfileId = requestedProfile === undefined
+    ? OPENAI_CHAT_TRANSPORT_PROFILE
+    : requestedProfile
+  if (
+    transportProfileId !== OPENAI_CHAT_TRANSPORT_PROFILE
+    && transportProfileId !== ANTHROPIC_MESSAGES_OPUS5_TRANSPORT_PROFILE
+  ) {
+    fail(
+      '--transport-profile must be openai-chat-onetoken-v1 or ' +
+        'anthropic-messages-opus5-onetoken-v1',
+    )
+  }
+  const workspaceValue = args.options.get('--anthropic-workspace-id')
+  const anthropicWorkspaceId = typeof workspaceValue === 'string'
+    ? workspaceValue.trim()
+    : null
+  if (anthropicWorkspaceId !== null) {
+    if (transportProfileId !== ANTHROPIC_MESSAGES_OPUS5_TRANSPORT_PROFILE) {
+      fail('--anthropic-workspace-id requires the Anthropic transport profile')
+    }
+    if (
+      anthropicWorkspaceId.length === 0
+      || anthropicWorkspaceId.length > 256
+      || /[\r\n\0]/u.test(anthropicWorkspaceId)
+    ) {
+      fail('--anthropic-workspace-id must be 1-256 header-safe characters')
+    }
+  }
+  const retryBudgetValue = args.options.get('--retry-budget')
+  const retryBudget = typeof retryBudgetValue === 'string' ? Number(retryBudgetValue) : 240
+  if (!Number.isSafeInteger(retryBudget) || retryBudget < 0) {
+    fail('--retry-budget must be a non-negative integer')
+  }
   return {
     role,
     schedulerSeed,
@@ -365,10 +417,25 @@ function readPaperCliOptions(args: ParsedArgs): PaperCliOptions {
     samplesPerCell,
     concurrency,
     timeoutMs,
+    transportProfileId,
+    anthropicWorkspaceId,
+    retryBudget,
   }
 }
 
-function makeProgressRenderer(args: ParsedArgs): ((event: ProgressEvent) => void) | undefined {
+interface CliProgressEvent {
+  stage: 'adapter' | 'sampling'
+  done: number
+  total: number
+  errors: number
+  strategy?: string
+  detail?: string | null
+  lastErrorKind?: string | null
+  lastHttpStatus?: number | null
+  retrying?: boolean
+}
+
+function makeProgressRenderer(args: ParsedArgs): ((event: CliProgressEvent) => void) | undefined {
   if (args.options.get('--quiet')) return undefined
   const isTty = process.stderr.isTTY === true
   return (event) => {
@@ -766,6 +833,7 @@ function paperSafeSummary(result: PaperCollectionResult): Record<string, unknown
     interpretation: 'uncalibrated-non-decision-evidence',
     decisionEligible: false,
     protocol: result.fingerprint.protocol,
+    transportProfileId: result.fingerprint.manifest.transportProfileId ?? null,
     model: result.fingerprint.model,
     role: result.fingerprint.plan.role,
     cellCount: result.fingerprint.plan.cellIds.length,
@@ -774,6 +842,8 @@ function paperSafeSummary(result: PaperCollectionResult): Record<string, unknown
     validSamples: result.fingerprint.quality.validSamples,
     invalidSamples: result.fingerprint.quality.invalidSamples,
     errorSamples: result.fingerprint.quality.errorSamples,
+    attemptCount: result.fingerprint.quality.attemptCount ?? null,
+    retryCount: result.fingerprint.quality.retryCount ?? null,
     directness: result.fingerprint.quality.directness,
     splitHalfMeanJsd: splitHalf.meanJsd,
     splitHalfComparableCells: splitHalf.cells.length,
@@ -796,15 +866,62 @@ async function cmdPaperFingerprint(args: ParsedArgs): Promise<number> {
     )
   }
 
+  const abortController = new AbortController()
+  let interruptedSignal: NodeJS.Signals | null = null
+  const interrupt = (signal: NodeJS.Signals): void => {
+    interruptedSignal = signal
+    abortController.abort()
+  }
+  const onSigterm = (): void => interrupt('SIGTERM')
+  const onSigint = (): void => interrupt('SIGINT')
+  process.once('SIGTERM', onSigterm)
+  process.once('SIGINT', onSigint)
+
+  const renderProgress = makeProgressRenderer(args)
+  let lastCheckpoint: PaperCollectionResult | null = null
+  let completedSamples = 0
+  let errorSamples = 0
   let result: PaperCollectionResult
   try {
-    const request = createOpenAICompatiblePaperTransport({
+    const commonTransportOptions = {
       baseUrl: endpoint.baseUrl,
-      apiKey: endpoint.apiKey,
       timeoutMs: paper.timeoutMs,
-    })
+      retryBudget: paper.retryBudget,
+      allowInsecureLoopbackForTests:
+        process.env.LLMFP_ALLOW_INSECURE_LOOPBACK_FOR_TESTS === '1',
+      signal: abortController.signal,
+      onRetry: (event: {
+        kind: string
+        status: number | null
+      }) => {
+        renderProgress?.({
+          stage: 'sampling',
+          done: completedSamples,
+          total: plannedRequests,
+          errors: errorSamples,
+          detail: 'retry_wait',
+          lastErrorKind: event.kind,
+          lastHttpStatus: event.status,
+          retrying: true,
+        })
+      },
+    }
+    const request = paper.transportProfileId === ANTHROPIC_MESSAGES_OPUS5_TRANSPORT_PROFILE
+      ? createAnthropicMessagesOpus5Transport({
+          ...commonTransportOptions,
+          apiKey: endpoint.apiKey
+            ?? fail('Anthropic transport requires --api-key-env'),
+          headers: paper.anthropicWorkspaceId === null
+            ? undefined
+            : { 'anthropic-workspace-id': paper.anthropicWorkspaceId },
+        })
+      : createOpenAICompatiblePaperTransport({
+          ...commonTransportOptions,
+          apiKey: endpoint.apiKey,
+        })
     result = await collectBruckner2026PaperFingerprint({
       model: endpoint.model,
+      transportProfileId: paper.transportProfileId,
       role: paper.role,
       schedulerSeed: paper.schedulerSeed,
       samplesPerCell: paper.samplesPerCell,
@@ -812,11 +929,38 @@ async function cmdPaperFingerprint(args: ParsedArgs): Promise<number> {
       request,
       abortOnRequestError: true,
       abortOnProviderError: true,
+      signal: abortController.signal,
+      onCheckpoint: (checkpoint) => {
+        lastCheckpoint = checkpoint
+      },
+      onProgress: (event) => {
+        completedSamples = event.done
+        errorSamples = event.errors
+        renderProgress?.(event)
+      },
     })
     writePaperOutputsAtomic(preparedOutputs, result)
   } catch (error) {
-    abortPaperOutputs(preparedOutputs)
+    const retained = lastCheckpoint as PaperCollectionResult | null
+    if (
+      interruptedSignal !== null
+      && retained !== null
+      && retained.fingerprint.partial === true
+      && retained.fingerprint.quality.completedSamples > 0
+    ) {
+      retained.fingerprint.incompleteReason = 'sampling_interrupted'
+      writePaperOutputsAtomic(preparedOutputs, retained)
+      process.stderr.write(
+        `paper-profile partial evidence retained after ${interruptedSignal}: ` +
+          `${retained.fingerprint.quality.completedSamples}/${plannedRequests}\n`,
+      )
+    } else {
+      abortPaperOutputs(preparedOutputs)
+    }
     throw error
+  } finally {
+    process.off('SIGTERM', onSigterm)
+    process.off('SIGINT', onSigint)
   }
   process.stderr.write(`paper-profile V2 fingerprint written to ${paper.out}\n`)
   process.stderr.write(`canonical raw evidence written to ${paper.samplesOut}\n`)

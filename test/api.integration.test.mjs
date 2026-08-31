@@ -8,6 +8,8 @@ import { after, before, test } from 'node:test'
 
 import { compare, fingerprint, verify } from '../dist/api.js'
 
+process.env.LLMFP_ALLOW_INSECURE_LOOPBACK_FOR_TESTS = '1'
+
 /** Two simulated "models" with different answer distributions. */
 const MODEL_BEHAVIOR = {
   'mock-alpha': {

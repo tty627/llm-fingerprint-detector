@@ -22,9 +22,9 @@ const BODY = {
   usage: { include: true },
 }
 
-test('paper HTTP defaults pin the archived run timeout and retry count', () => {
+test('paper HTTP defaults pin timeout and the two-retry safety bound', () => {
   assert.equal(BRUCKNER_2026_HTTP_TIMEOUT_MS, 90_000)
-  assert.equal(BRUCKNER_2026_HTTP_RETRIES, 5)
+  assert.equal(BRUCKNER_2026_HTTP_RETRIES, 2)
   assert.equal(BRUCKNER_2026_HTTP_MAX_RESPONSE_BYTES, 1024 * 1024)
 })
 
@@ -62,6 +62,7 @@ test('paper HTTP transport sends the collector body unchanged and key only as Au
   })
 
   assert.equal(observedUrl, 'https://paper.invalid/v1/chat/completions')
+  assert.equal(observedInit.redirect, 'error')
   assert.deepEqual(JSON.parse(observedInit.body), BODY)
   assert.deepEqual(Object.keys(JSON.parse(observedInit.body)), [
     'model',
@@ -168,7 +169,7 @@ test('paper HTTP transport rejects oversized successful JSON without retaining i
   )
 })
 
-test('paper HTTP default network retry bound is six physical attempts per job', async () => {
+test('paper HTTP default network retry bound is three physical attempts per job', async () => {
   let calls = 0
   let delays = 0
   const request = createOpenAICompatiblePaperTransport({
@@ -187,10 +188,10 @@ test('paper HTTP default network retry bound is six physical attempts per job', 
     (error) =>
       error instanceof PaperHttpRequestError
       && error.kind === 'network'
-      && error.attempts === 6,
+      && error.attempts === 3,
   )
-  assert.equal(calls, 6)
-  assert.equal(delays, 5)
+  assert.equal(calls, 3)
+  assert.equal(delays, 2)
 })
 
 test('paper HTTP errors never disclose response bodies, credentials, or endpoint URLs', async () => {

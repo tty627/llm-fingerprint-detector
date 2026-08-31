@@ -337,10 +337,13 @@ export const BRUCKNER_2026_CANONICAL40_CELLS: readonly Bruckner2026ProtocolCell[
 )
 
 /** Build the self-describing V2 manifest without enabling this profile by default. */
-export function buildBruckner2026Canonical40Manifest(): ProtocolManifest {
+export function buildBruckner2026Canonical40Manifest(
+  transportProfileId = 'openai-chat-onetoken-v1',
+): ProtocolManifest {
   return validateProtocolManifest({
     manifestVersion: 1,
     protocolId: `${BRUCKNER_2026_PROFILE_ID}/v1`,
+    transportProfileId,
     battery: {
       id: BRUCKNER_2026_PROFILE_ID,
       version: BRUCKNER_2026_PROFILE_VERSION,

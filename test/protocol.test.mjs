@@ -134,6 +134,12 @@ test('V2 manifest changes are incompatible; plan changes are policy inputs', () 
   assert.equal(manifestResult.manifestMatch, false)
   assert.ok(manifestResult.issues.some((issue) => issue.code === 'manifest_mismatch'))
 
+  const transportMismatch = structuredClone(left)
+  transportMismatch.manifest.transportProfileId = 'anthropic-messages-opus5-onetoken-v1'
+  const transportResult = checkFingerprintCompatibility(left, transportMismatch)
+  assert.equal(transportResult.status, 'incompatible')
+  assert.equal(transportResult.manifestMatch, false)
+
   const differentPlan = v2Fingerprint(1)
   const planResult = checkFingerprintCompatibility(left, differentPlan)
   assert.equal(planResult.status, 'compatible')

@@ -188,6 +188,9 @@ export async function runProbeBattery(options: SamplerOptions): Promise<SamplerR
           if (error.kind === 'auth') {
             fatalError = new ProbeRunError('auth', error.message)
           }
+          if (error.kind === 'redirect' || error.kind === 'unsafe_endpoint') {
+            fatalError = new ProbeRunError('network', error.message)
+          }
           lastErrorKind = error.kind
           lastHttpStatus = error.status
           if (error.kind === 'network') {

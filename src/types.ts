@@ -170,6 +170,8 @@ export type CanonicalJsonValue =
 export interface ProtocolManifest {
   manifestVersion: 1
   protocolId: string
+  /** Wire-level request/response profile; absent only on legacy V2 artifacts. */
+  transportProfileId?: string
   battery: {
     id: string
     version: string
@@ -227,6 +229,10 @@ export interface CollectionQuality {
   reasoningUsageObservedSamples: number
   /** SHA-256 of separately retained raw evidence, or null when none is retained. */
   rawEvidenceSha256: string | null
+  /** Physical upstream requests observed by strict transports. */
+  attemptCount?: number
+  /** Extra physical attempts beyond logical jobs. */
+  retryCount?: number
 }
 
 export type CompatibilityIssueCode =
@@ -369,7 +375,14 @@ export interface ProgressEvent {
   retrying?: boolean
 }
 
-export type ProbeErrorKind = 'network' | 'auth' | 'http' | 'timeout' | 'aborted'
+export type ProbeErrorKind =
+  | 'network'
+  | 'auth'
+  | 'http'
+  | 'timeout'
+  | 'aborted'
+  | 'redirect'
+  | 'unsafe_endpoint'
 
 export interface FingerprintOptions {
   /**

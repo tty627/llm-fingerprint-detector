@@ -88,7 +88,15 @@ export interface ChatCompletionRequest {
   timeoutMs?: number
   retries?: number
   onRetry?: (event: RetryEvent) => void
+  /** Injectable resolver used to revalidate every physical request attempt. */
+  resolver?: ProbeHostResolver
+  /** Test-only escape hatch: HTTP is allowed only for an all-loopback result. */
+  allowInsecureLoopbackForTests?: boolean
+  /** Injectable transport used by deterministic security tests. */
+  fetchImpl?: typeof fetch
 }
+
+export type ProbeHostResolver = (hostname: string) => Promise<readonly string[]>
 
 export interface RetryEvent {
   /** One-based retry number (the request attempt that will run next). */
@@ -146,6 +154,112 @@ async function delay(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
+const RETRYABLE_HTTP_STATUSES = new Set([429, 500, 502, 503, 504])
+
+function ipv4Number(address: string): number | null {
+  const octets = address.split('.')
+  if (octets.length !== 4 || octets.some((part) => !/^\d{1,3}$/u.test(part))) return null
+  const values = octets.map(Number)
+  if (values.some((part) => part < 0 || part > 255)) return null
+  return ((values[0] << 24) | (values[1] << 16) | (values[2] << 8) | values[3]) >>> 0
+}
+
+function inIpv4Range(value: number, base: string, prefix: number): boolean {
+  const baseValue = ipv4Number(base)
+  if (baseValue === null) return false
+  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0
+  return (value & mask) === (baseValue & mask)
+}
+
+function normalizedHostAddress(address: string): string {
+  const withoutBrackets = address.startsWith('[') && address.endsWith(']')
+    ? address.slice(1, -1)
+    : address
+  return withoutBrackets.toLowerCase().split('%')[0]
+}
+
+function isLoopbackAddress(address: string): boolean {
+  const normalized = normalizedHostAddress(address)
+  const ipv4 = ipv4Number(normalized)
+  if (ipv4 !== null) return inIpv4Range(ipv4, '127.0.0.0', 8)
+  return normalized === '::1' || normalized.startsWith('::ffff:127.')
+}
+
+/** Conservative public-address allow policy for endpoint credentials. */
+export function isUnsafeProbeEndpointAddress(address: string): boolean {
+  const normalized = normalizedHostAddress(address)
+  const ipv4 = ipv4Number(normalized)
+  if (ipv4 !== null) {
+    return [
+      ['0.0.0.0', 8],
+      ['10.0.0.0', 8],
+      ['100.64.0.0', 10],
+      ['127.0.0.0', 8],
+      ['169.254.0.0', 16],
+      ['172.16.0.0', 12],
+      ['192.0.0.0', 24],
+      ['192.0.2.0', 24],
+      ['192.168.0.0', 16],
+      ['198.18.0.0', 15],
+      ['198.51.100.0', 24],
+      ['203.0.113.0', 24],
+      ['224.0.0.0', 4],
+      ['240.0.0.0', 4],
+    ].some(([base, prefix]) => inIpv4Range(ipv4, base as string, prefix as number))
+  }
+  // URL parsing canonicalizes unusual IPv4 spellings before this point.
+  if (!normalized.includes(':')) return true
+  if (normalized === '::' || normalized === '::1') return true
+  if (normalized.startsWith('::ffff:')) {
+    return isUnsafeProbeEndpointAddress(normalized.slice('::ffff:'.length))
+  }
+  return normalized.startsWith('fc')
+    || normalized.startsWith('fd')
+    || /^fe[89ab]/u.test(normalized)
+    || normalized.startsWith('ff')
+    || normalized.startsWith('2001:db8:')
+    || normalized.startsWith('2001:2:')
+    || normalized.startsWith('2002:')
+}
+
+const defaultResolver: ProbeHostResolver = async (hostname) => {
+  const normalized = normalizedHostAddress(hostname)
+  if (ipv4Number(normalized) !== null || normalized.includes(':')) return [normalized]
+  const dns = await import('node:dns/promises')
+  const records = await dns.lookup(normalized, { all: true, verbatim: true })
+  return records.map((record) => record.address)
+}
+
+async function assertSafeEndpoint(request: ChatCompletionRequest): Promise<void> {
+  let parsed: URL
+  try {
+    parsed = new URL(`${request.endpoint.baseUrl}/chat/completions`)
+  } catch {
+    throw new ProbeRequestError('unsafe_endpoint', 'Endpoint URL is invalid')
+  }
+  let addresses: readonly string[]
+  try {
+    addresses = await (request.resolver ?? defaultResolver)(parsed.hostname)
+  } catch {
+    throw new ProbeRequestError('network', 'Endpoint DNS resolution failed')
+  }
+  if (addresses.length === 0) throw new ProbeRequestError('network', 'Endpoint DNS resolution failed')
+  const envAllowsLoopback =
+    typeof process !== 'undefined'
+    && process.env.LLMFP_ALLOW_INSECURE_LOOPBACK_FOR_TESTS === '1'
+  const allowLoopback = request.allowInsecureLoopbackForTests === true || envAllowsLoopback
+  const onlyLoopback = addresses.every(isLoopbackAddress)
+  if (parsed.protocol !== 'https:') {
+    if (!(allowLoopback && onlyLoopback)) {
+      throw new ProbeRequestError('unsafe_endpoint', 'Endpoint must use HTTPS')
+    }
+    return
+  }
+  if (addresses.some(isUnsafeProbeEndpointAddress)) {
+    throw new ProbeRequestError('unsafe_endpoint', 'Endpoint resolved to a non-public address')
+  }
+}
+
 /**
  * One chat/completions call with retries. Retried: 429, 5xx, timeouts.
  * Not retried: transport errors and 401/403 — those are classified and
@@ -154,12 +268,13 @@ async function delay(ms: number, signal?: AbortSignal): Promise<void> {
 export async function fetchChatCompletion(
   request: ChatCompletionRequest,
 ): Promise<ChatCompletionResult> {
-  const retries = request.retries ?? DEFAULT_MAX_RETRIES
+  const retries = Math.min(request.retries ?? DEFAULT_MAX_RETRIES, DEFAULT_MAX_RETRIES)
   const timeoutMs = request.timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
   let lastError: ProbeRequestError | null = null
 
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (request.signal?.aborted) throw new ProbeRequestError('aborted', 'Aborted')
+    await assertSafeEndpoint(request)
 
     const timeoutController = new AbortController()
     const timer = setTimeout(() => timeoutController.abort(), timeoutMs)
@@ -175,7 +290,8 @@ export async function fetchChatCompletion(
       if (request.endpoint.apiKey) {
         headers.Authorization = `Bearer ${request.endpoint.apiKey}`
       }
-      const response = await fetch(`${request.endpoint.baseUrl}/chat/completions`, {
+      const fetchImpl = request.fetchImpl ?? globalThis.fetch
+      const response = await fetchImpl(`${request.endpoint.baseUrl}/chat/completions`, {
         method: 'POST',
         headers,
         body: JSON.stringify({
@@ -190,18 +306,25 @@ export async function fetchChatCompletion(
           ...request.extraBody,
         }),
         signal: timeoutController.signal,
+        redirect: 'error',
       })
       const latencyMs = performance.now() - startedAt
 
+      if (response.redirected || (response.status >= 300 && response.status < 400)) {
+        try { await response.body?.cancel() } catch { /* Preserve safe typed error. */ }
+        throw new ProbeRequestError('redirect', 'Endpoint redirect was rejected', response.status)
+      }
       if (response.status === 401 || response.status === 403) {
+        try { await response.body?.cancel() } catch { /* Preserve safe typed error. */ }
         throw new ProbeRequestError(
           'auth',
           `HTTP ${response.status} — API key rejected`,
           response.status,
         )
       }
-      if (response.status === 429 || response.status >= 500) {
+      if (RETRYABLE_HTTP_STATUSES.has(response.status)) {
         const retryAfterHeader = response.headers.get('retry-after')
+        try { await response.body?.cancel() } catch { /* Preserve safe typed error. */ }
         lastError = new ProbeRequestError('http', `HTTP ${response.status}`, response.status)
         if (attempt < retries) {
           const backoff = retryDelayMs(retryAfterHeader, attempt)
@@ -218,15 +341,10 @@ export async function fetchChatCompletion(
         throw lastError
       }
       if (!response.ok) {
-        let detail = ''
-        try {
-          detail = (await response.text()).slice(0, 300)
-        } catch {
-          // Ignore body read failures.
-        }
+        try { await response.body?.cancel() } catch { /* Preserve safe typed error. */ }
         throw new ProbeRequestError(
           'http',
-          `HTTP ${response.status} ${detail}`.trim(),
+          `HTTP ${response.status}`,
           response.status,
         )
       }
@@ -247,12 +365,9 @@ export async function fetchChatCompletion(
       if (timeoutController.signal.aborted) {
         lastError = new ProbeRequestError('timeout', `Request timed out after ${timeoutMs}ms`)
       } else {
-        lastError = new ProbeRequestError(
-          'network',
-          error instanceof Error ? error.message : 'Network error',
-        )
+        lastError = new ProbeRequestError('network', 'Endpoint request failed')
       }
-      if (lastError.kind === 'timeout' && attempt < retries) {
+      if ((lastError.kind === 'timeout' || lastError.kind === 'network') && attempt < retries) {
         request.onRetry?.({
           attempt: attempt + 1,
           maxRetries: retries,

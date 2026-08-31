@@ -103,6 +103,7 @@ test('profile validator rejects unknown fields and prompt drift', () => {
 
 test('V2 manifest pins author-compatible normalization and sampling requirements', () => {
   const manifest = buildBruckner2026Canonical40Manifest()
+  assert.equal(manifest.transportProfileId, 'openai-chat-onetoken-v1')
   assert.deepEqual(manifest.normalization, {
     id: 'bruckner-author-compatible-normalizer/v1',
     version: '1.0.0',

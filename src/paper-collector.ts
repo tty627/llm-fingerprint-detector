@@ -94,6 +94,11 @@ export interface PaperSensitiveTextResult {
 
 export type PaperSensitiveTextRedactor = (value: string) => PaperSensitiveTextResult
 
+export interface PaperTransportMetrics {
+  attemptCount: number
+  retryCount: number
+}
+
 export interface PaperRequestFunction {
   (
     body: Readonly<PaperDirectRequestBody>,
@@ -104,10 +109,14 @@ export interface PaperRequestFunction {
    * body. The collector applies it to every response string it persists.
    */
   readonly redactSensitiveText?: PaperSensitiveTextRedactor
+  /** Monotonic, credential-free counters shared by all requests in this run. */
+  readonly getTransportMetrics?: () => PaperTransportMetrics
 }
 
 export interface PaperCollectorOptions {
   model: string
+  /** Exact wire protocol; embedded in the manifest and compared strictly. */
+  transportProfileId?: string
   role: CollectionPlan['role']
   samplesPerCell: number
   schedulerSeed: string
@@ -126,6 +135,27 @@ export interface PaperCollectorOptions {
   abortOnRequestError?: boolean
   /** Network-facing callers may stop after a provider error returned with HTTP 200. */
   abortOnProviderError?: boolean
+  /** Abort the collection and all transport work that honors this signal. */
+  signal?: AbortSignal
+  /** Safe, credential-free progress emitted after every terminal sample. */
+  onProgress?: (event: PaperCollectionProgressEvent) => void
+  /**
+   * Aggregate V2 + canonical JSONL checkpoint. Partial checkpoints are never
+   * decision eligible and are emitted before their matching progress event.
+   */
+  onCheckpoint?: (checkpoint: PaperCollectionResult) => void
+}
+
+export interface PaperCollectionProgressEvent {
+  stage: 'sampling'
+  done: number
+  total: number
+  errors: number
+  cellId: ProtocolCellId
+  detail: null
+  lastErrorKind: PaperCollectionRequestErrorKind | PaperRawSampleEvidence['errorKind']
+  lastHttpStatus: number | null
+  retrying: false
 }
 
 export type PaperCollectionRequestErrorKind =
@@ -136,6 +166,10 @@ export type PaperCollectionRequestErrorKind =
   | 'non_json'
   | 'network'
   | 'response_too_large'
+  | 'redirect'
+  | 'unsafe_endpoint'
+  | 'malformed_response'
+  | 'retry_budget_exhausted'
   | 'provider_error'
   | 'request_failed'
 
@@ -154,6 +188,10 @@ export class PaperCollectionRequestError extends Error {
       'non_json',
       'network',
       'response_too_large',
+      'redirect',
+      'unsafe_endpoint',
+      'malformed_response',
+      'retry_budget_exhausted',
       'provider_error',
       'request_failed',
     ]
@@ -806,6 +844,7 @@ function buildQuality(
   evidence: readonly PaperRawSampleEvidence[],
   expectedSamples: number,
   rawEvidenceSha256: string,
+  transportMetrics: PaperTransportMetrics,
 ): CollectionQuality {
   const count = (category: SampleCategory): number =>
     evidence.filter((sample) => sample.category === category).length
@@ -846,6 +885,8 @@ function buildQuality(
     reasoningTokenCount,
     reasoningUsageObservedSamples,
     rawEvidenceSha256,
+    attemptCount: transportMetrics.attemptCount,
+    retryCount: transportMetrics.retryCount,
   }
 }
 
@@ -914,24 +955,119 @@ export async function collectBruckner2026PaperFingerprint(
   const concurrency = requirePositiveInteger(options.concurrency ?? 1, 'concurrency')
   const now = options.now ?? (() => new Date())
   const collectedAt = normalizeIsoTimestamp(options.collectedAt ?? now(), 'collectedAt')
-  const manifest = buildBruckner2026Canonical40Manifest()
+  const manifest = buildBruckner2026Canonical40Manifest(options.transportProfileId)
   const jobs = createBruckner2026CollectionJobs(options.samplesPerCell, options.schedulerSeed)
   const evidenceInScheduleOrder = new Array<PaperRawSampleEvidence>(jobs.length)
   let nextJobIndex = 0
   let fatalRequestError: PaperCollectionRequestError | null = null
 
+  const completedEvidence = (): PaperRawSampleEvidence[] =>
+    evidenceInScheduleOrder.filter(
+      (sample): sample is PaperRawSampleEvidence => sample !== undefined,
+    )
+
+  const buildResult = (incompleteReason?: string): PaperCollectionResult => {
+    const evidence = completedEvidence().sort(compareEvidenceOrder)
+    const rawEvidenceJsonl = serializePaperRawEvidenceJsonl(evidence)
+    const rawEvidenceSha256 = sha256(rawEvidenceJsonl)
+    const cellIds = BRUCKNER_2026_CANONICAL40_CELLS.map((cell) => cell.cellId)
+    const plan: CollectionPlan = {
+      planVersion: 1,
+      role: options.role,
+      cellIds,
+      samplesPerCell: options.samplesPerCell,
+      expectedSamples: jobs.length,
+      schedulerSeed: options.schedulerSeed,
+      schedulerPolicy: BRUCKNER_2026_SCHEDULER_POLICY,
+    }
+    const transportMetrics = options.request.getTransportMetrics?.() ?? {
+      attemptCount: evidence.length,
+      retryCount: 0,
+    }
+    const quality = buildQuality(evidence, jobs.length, rawEvidenceSha256, transportMetrics)
+    const cells: Partial<Record<ProtocolCellId, V2CellDistribution>> = {}
+    for (const cell of BRUCKNER_2026_CANONICAL40_CELLS) {
+      cells[cell.cellId] = buildCellDistribution(
+        cell,
+        evidence.filter((sample) => sample.cellId === cell.cellId),
+      )
+    }
+
+    const fingerprint: FingerprintV2 = {
+      formatVersion: 2,
+      protocol: manifest.protocolId,
+      model: options.model,
+      collectedAt,
+      samplesPerCell: options.samplesPerCell,
+      // This collector never uses the legacy post-reasoning fallback. Observable
+      // contamination is represented solely by quality.directness/counters.
+      postReasoning: false,
+      cells,
+      manifest,
+      plan,
+      quality,
+      completedSamples: quality.completedSamples,
+      expectedSamples: quality.expectedSamples,
+      errorCount: quality.errorSamples,
+      meta: {
+        tool: 'llm-fingerprint-detector',
+        channel: 'paper-profile-direct',
+        source: `doi:${BRUCKNER_2026_CANONICAL40_PROFILE.source.softwareDoi}`,
+        note: 'opt-in canonical Study A profile; raw evidence retained separately',
+      },
+    }
+    if (!quality.complete) {
+      fingerprint.partial = true
+      fingerprint.incompleteReason = incompleteReason ?? 'sampling_in_progress'
+    }
+    validateFingerprint(fingerprint, {
+      sourceLabel: quality.complete ? 'paper collection' : 'paper collection checkpoint',
+      rejectPartial: quality.complete,
+    })
+    return { fingerprint, evidence, rawEvidenceJsonl, jobs }
+  }
+
+  const emitCheckpoint = (incompleteReason = 'sampling_in_progress'): void => {
+    options.onCheckpoint?.(buildResult(incompleteReason))
+  }
+
+  // An initial aggregate-only checkpoint makes a controlled interruption safe
+  // even before the first request finishes. The CLI only exposes it when at
+  // least one evidence record exists.
+  emitCheckpoint()
+
   async function worker(): Promise<void> {
     while (fatalRequestError === null) {
+      if (options.signal?.aborted) {
+        fatalRequestError = new PaperCollectionRequestError({ kind: 'aborted' })
+        return
+      }
       const jobIndex = nextJobIndex
       nextJobIndex += 1
       if (jobIndex >= jobs.length) return
       try {
-        evidenceInScheduleOrder[jobIndex] = await collectOne(
+        const sample = await collectOne(
           options,
           manifest.protocolId,
           jobs[jobIndex],
           now,
         )
+        evidenceInScheduleOrder[jobIndex] = sample
+        // Capture the evidence before reporting progress. A controller that
+        // cancels immediately on this event can therefore still retain it.
+        emitCheckpoint()
+        const evidence = completedEvidence()
+        options.onProgress?.({
+          stage: 'sampling',
+          done: evidence.length,
+          total: jobs.length,
+          errors: evidence.filter((item) => item.category === 'error').length,
+          cellId: sample.cellId,
+          detail: null,
+          lastErrorKind: sample.errorKind,
+          lastHttpStatus: null,
+          retrying: false,
+        })
       } catch (error) {
         if (fatalRequestError === null) {
           fatalRequestError = error instanceof PaperCollectionRequestError
@@ -946,53 +1082,15 @@ export async function collectBruckner2026PaperFingerprint(
   await Promise.all(
     Array.from({ length: Math.min(concurrency, jobs.length) }, () => worker()),
   )
-  if (fatalRequestError !== null) throw fatalRequestError
-
-  const evidence = [...evidenceInScheduleOrder].sort(compareEvidenceOrder)
-  const rawEvidenceJsonl = serializePaperRawEvidenceJsonl(evidence)
-  const rawEvidenceSha256 = sha256(rawEvidenceJsonl)
-  const cellIds = BRUCKNER_2026_CANONICAL40_CELLS.map((cell) => cell.cellId)
-  const plan: CollectionPlan = {
-    planVersion: 1,
-    role: options.role,
-    cellIds,
-    samplesPerCell: options.samplesPerCell,
-    expectedSamples: jobs.length,
-    schedulerSeed: options.schedulerSeed,
-    schedulerPolicy: BRUCKNER_2026_SCHEDULER_POLICY,
-  }
-  const quality = buildQuality(evidence, jobs.length, rawEvidenceSha256)
-  const cells: Partial<Record<ProtocolCellId, V2CellDistribution>> = {}
-  for (const cell of BRUCKNER_2026_CANONICAL40_CELLS) {
-    cells[cell.cellId] = buildCellDistribution(
-      cell,
-      evidence.filter((sample) => sample.cellId === cell.cellId),
+  const collectionError = fatalRequestError as PaperCollectionRequestError | null
+  if (collectionError !== null) {
+    emitCheckpoint(
+      collectionError.kind === 'aborted' ? 'sampling_interrupted' : 'sampling_failed',
     )
+    throw collectionError
   }
 
-  const fingerprint: FingerprintV2 = {
-    formatVersion: 2,
-    protocol: manifest.protocolId,
-    model: options.model,
-    collectedAt,
-    samplesPerCell: options.samplesPerCell,
-    // This collector never uses the legacy post-reasoning fallback. Observable
-    // contamination is represented solely by quality.directness/counters.
-    postReasoning: false,
-    cells,
-    manifest,
-    plan,
-    quality,
-    completedSamples: quality.completedSamples,
-    expectedSamples: quality.expectedSamples,
-    errorCount: quality.errorSamples,
-    meta: {
-      tool: 'llm-fingerprint-detector',
-      channel: 'paper-profile-direct',
-      source: `doi:${BRUCKNER_2026_CANONICAL40_PROFILE.source.softwareDoi}`,
-      note: 'opt-in canonical Study A profile; raw evidence retained separately',
-    },
-  }
-  validateFingerprint(fingerprint, { sourceLabel: 'paper collection', rejectPartial: true })
-  return { fingerprint, evidence, rawEvidenceJsonl, jobs }
+  const result = buildResult()
+  options.onCheckpoint?.(result)
+  return result
 }

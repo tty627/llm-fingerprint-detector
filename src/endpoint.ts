@@ -31,6 +31,9 @@ export function normalizeBaseUrl(input: string): BaseUrlNormalization {
   } catch {
     return { ok: false, normalized: trimmed, reason: 'invalid', warnings: [] }
   }
+  if (url.username || url.password || url.search || url.hash) {
+    return { ok: false, normalized: '', reason: 'invalid', warnings: [] }
+  }
 
   const warnings: string[] = []
   const isLocal =
@@ -79,7 +82,7 @@ export function resolveEndpoint(endpoint: Endpoint): {
   const { ok, normalized, reason, warnings } = normalizeBaseUrl(endpoint.baseUrl)
   if (!ok) {
     throw new Error(
-      reason === 'empty' ? 'Endpoint baseUrl is empty' : `Invalid baseUrl: ${endpoint.baseUrl}`,
+      reason === 'empty' ? 'Endpoint baseUrl is empty' : 'Invalid endpoint baseUrl',
     )
   }
   if (!endpoint.model || !endpoint.model.trim()) {

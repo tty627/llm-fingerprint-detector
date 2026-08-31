@@ -85,7 +85,13 @@ export async function detectReasoningAdapter(
       }
     } catch (error) {
       if (error instanceof ProbeRequestError) {
-        if (error.kind === 'auth' || error.kind === 'network' || error.kind === 'aborted') {
+        if (
+          error.kind === 'auth'
+          || error.kind === 'network'
+          || error.kind === 'aborted'
+          || error.kind === 'redirect'
+          || error.kind === 'unsafe_endpoint'
+        ) {
           throw error
         }
         // 4xx parameter rejection or timeout: try the next strategy.
@@ -116,7 +122,13 @@ export async function detectReasoningAdapter(
   } catch (error) {
     if (
       error instanceof ProbeRequestError &&
-      (error.kind === 'auth' || error.kind === 'network' || error.kind === 'aborted')
+      (
+        error.kind === 'auth'
+        || error.kind === 'network'
+        || error.kind === 'aborted'
+        || error.kind === 'redirect'
+        || error.kind === 'unsafe_endpoint'
+      )
     ) {
       throw error
     }

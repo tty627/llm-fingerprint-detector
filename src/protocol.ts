@@ -76,7 +76,15 @@ export function validateProtocolManifest(
   const manifest = requireRecord(value, sourceLabel, 'manifest')
   assertExactKeys(
     manifest,
-    ['manifestVersion', 'protocolId', 'battery', 'prompts', 'normalization', 'sampling'],
+    [
+      'manifestVersion',
+      'protocolId',
+      ...(Object.hasOwn(manifest, 'transportProfileId') ? ['transportProfileId'] : []),
+      'battery',
+      'prompts',
+      'normalization',
+      'sampling',
+    ],
     sourceLabel,
     'manifest',
   )
@@ -84,6 +92,13 @@ export function validateProtocolManifest(
     schemaError(sourceLabel, 'manifest.manifestVersion', 'must equal 1')
   }
   requireNonEmptyString(manifest.protocolId, sourceLabel, 'manifest.protocolId')
+  if (Object.hasOwn(manifest, 'transportProfileId')) {
+    requireNonEmptyString(
+      manifest.transportProfileId,
+      sourceLabel,
+      'manifest.transportProfileId',
+    )
+  }
 
   const battery = requireRecord(manifest.battery, sourceLabel, 'manifest.battery')
   assertExactKeys(battery, ['id', 'version', 'digest'], sourceLabel, 'manifest.battery')
