@@ -300,7 +300,7 @@ function validateCollectionQuality(
       'reasoningUsageObservedSamples',
       'rawEvidenceSha256',
     ],
-    [],
+    ['attemptCount', 'retryCount'],
     source,
     'quality',
   )
@@ -319,6 +319,18 @@ function validateCollectionQuality(
     'reasoningUsageObservedSamples',
   ] as const
   for (const key of keys) requireNonNegativeInteger(quality[key], source, `quality.${key}`)
+  const hasAttemptCount = Object.hasOwn(quality, 'attemptCount')
+  const hasRetryCount = Object.hasOwn(quality, 'retryCount')
+  if (hasAttemptCount !== hasRetryCount) {
+    fail(source, 'quality', 'attemptCount and retryCount must be present together')
+  }
+  if (hasAttemptCount) {
+    requireNonNegativeInteger(quality.attemptCount, source, 'quality.attemptCount')
+    requireNonNegativeInteger(quality.retryCount, source, 'quality.retryCount')
+    if ((quality.retryCount as number) > (quality.attemptCount as number)) {
+      fail(source, 'quality.retryCount', 'must not exceed attemptCount')
+    }
+  }
   if (
     quality.directness !== 'verified' &&
     quality.directness !== 'claimed' &&

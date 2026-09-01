@@ -13,6 +13,8 @@ import { MAX_RETRY_DELAY_MS } from '../dist/constants.js'
 import { fetchChatCompletion, retryDelayMs } from '../dist/http.js'
 import { parseFingerprintJson } from '../dist/reference.js'
 
+process.env.LLMFP_ALLOW_INSECURE_LOOPBACK_FOR_TESTS = '1'
+
 const CLI_PATH = fileURLToPath(new URL('../dist/cli.js', import.meta.url))
 const FIXED_ADAPTER = {
   strategy: 'none',

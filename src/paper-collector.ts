@@ -94,6 +94,12 @@ export interface PaperSensitiveTextResult {
 
 export type PaperSensitiveTextRedactor = (value: string) => PaperSensitiveTextResult
 
+export interface PaperTransportMetrics {
+  attemptCount: number
+  retryCount: number
+  retryBudgetUsed: number
+}
+
 export interface PaperRequestFunction {
   (
     body: Readonly<PaperDirectRequestBody>,
@@ -104,10 +110,16 @@ export interface PaperRequestFunction {
    * body. The collector applies it to every response string it persists.
    */
   readonly redactSensitiveText?: PaperSensitiveTextRedactor
+  /** Abort every in-flight request owned by this station after a fatal incident. */
+  readonly abortInFlight?: () => void
+  /** Monotonic, credential-free counters shared by all requests in this run. */
+  readonly getTransportMetrics?: () => PaperTransportMetrics
 }
 
 export interface PaperCollectorOptions {
   model: string
+  /** Exact wire protocol; embedded in the manifest and compared strictly. */
+  transportProfileId?: string
   role: CollectionPlan['role']
   samplesPerCell: number
   schedulerSeed: string
@@ -126,6 +138,30 @@ export interface PaperCollectorOptions {
   abortOnRequestError?: boolean
   /** Network-facing callers may stop after a provider error returned with HTTP 200. */
   abortOnProviderError?: boolean
+  /** Abort the collection and all transport work that honors this signal. */
+  signal?: AbortSignal
+  /** Safe, credential-free progress emitted after every terminal sample. */
+  onProgress?: (event: PaperCollectionProgressEvent) => void
+  /**
+   * Aggregate V2 + canonical JSONL checkpoint. Partial checkpoints are never
+   * decision eligible and are emitted before their matching progress event.
+   */
+  onCheckpoint?: (checkpoint: PaperCollectionResult) => void
+}
+
+export interface PaperCollectionProgressEvent {
+  stage: 'sampling'
+  done: number
+  total: number
+  errors: number
+  cellId: ProtocolCellId
+  detail: null
+  lastErrorKind: PaperCollectionRequestErrorKind | PaperRawSampleEvidence['errorKind']
+  lastHttpStatus: number | null
+  retrying: false
+  attemptCount: number
+  retryCount: number
+  retryBudgetUsed: number
 }
 
 export type PaperCollectionRequestErrorKind =
@@ -136,7 +172,12 @@ export type PaperCollectionRequestErrorKind =
   | 'non_json'
   | 'network'
   | 'response_too_large'
+  | 'redirect'
+  | 'unsafe_endpoint'
+  | 'malformed_response'
+  | 'retry_budget_exhausted'
   | 'provider_error'
+  | 'sensitive_credential_echo'
   | 'request_failed'
 
 /** Sanitized fail-fast error; it never retains the thrown error or its message. */
@@ -154,7 +195,12 @@ export class PaperCollectionRequestError extends Error {
       'non_json',
       'network',
       'response_too_large',
+      'redirect',
+      'unsafe_endpoint',
+      'malformed_response',
+      'retry_budget_exhausted',
       'provider_error',
+      'sensitive_credential_echo',
       'request_failed',
     ]
     const kind = typeof record?.kind === 'string'
@@ -422,7 +468,7 @@ function inspectReasoningTrace(
     ['choices[0]', choice],
     ['', response],
   ]
-  const reasoningField = /^(?:reasoning(?:_|$)|reasoningDetails$|thinking(?:_|$)|analysis(?:_|$))/i
+  const reasoningField = /^(?:reasoning(?:_|$)|reasoningDetails$|thinking(?:_|$)|analysis(?:_|$)|tool_calls?$|function_call$)/i
   const fields: string[] = []
   let characterCount = 0
   for (const [prefix, container] of containers) {
@@ -434,6 +480,14 @@ function inspectReasoningTrace(
       fields.push(prefix ? `${prefix}.${key}` : key)
       characterCount += length
     }
+  }
+  const visibleContent = message?.content
+  if (
+    typeof visibleContent === 'string'
+    && /<\s*\/?\s*(?:think(?:ing)?|analysis|reasoning|tool(?:_use|_result)?|function_calls?|invoke|use_mcp_tool)\b[^>]*>/iu.test(visibleContent)
+  ) {
+    fields.push('choices[0].message.content_internal_xml')
+    characterCount += visibleContent.length
   }
   return { fields, characterCount }
 }
@@ -452,6 +506,25 @@ function redactPersistedString(
   // A transport redactor must never return the original sensitive bytes. Use
   // a collector-owned marker if it reports a match without changing the text.
   return redacted.matched && redacted.text === value ? CREDENTIAL_REDACTION : redacted.text
+}
+
+function containsSensitiveCredentialValue(
+  value: unknown,
+  redactor: PaperSensitiveTextRedactor | undefined,
+  seen: Set<object> = new Set(),
+): boolean {
+  if (redactor === undefined) return false
+  if (typeof value === 'string') return redactor(value).matched
+  if (typeof value !== 'object' || value === null) return false
+  if (seen.has(value)) return false
+  seen.add(value)
+  if (Array.isArray(value)) {
+    return value.some((item) => containsSensitiveCredentialValue(item, redactor, seen))
+  }
+  return Object.entries(value).some(
+    ([key, item]) => redactor(key).matched
+      || containsSensitiveCredentialValue(item, redactor, seen),
+  )
 }
 
 function redactMetadataString(
@@ -548,7 +621,9 @@ async function collectOne(
   try {
     result = await options.request(buildBruckner2026DirectRequest(options.model, job), context)
   } catch (error) {
-    if (options.abortOnRequestError === true) {
+    const fatalCredentialEcho = isRecord(error)
+      && error.kind === 'sensitive_credential_echo'
+    if (options.abortOnRequestError === true || fatalCredentialEcho) {
       throw new PaperCollectionRequestError(error)
     }
     const receivedAt = normalizeIsoTimestamp(now(), 'now()')
@@ -588,6 +663,11 @@ async function collectOne(
 
   const receivedAt = normalizeIsoTimestamp(now(), 'now()')
   const resultRecord = isRecord(result) ? result : null
+  if (containsSensitiveCredentialValue(resultRecord, options.request.redactSensitiveText)) {
+    // Scan the complete adapter result, including unknown body/header metadata,
+    // before selecting or checkpointing any field.
+    throw new PaperCollectionRequestError({ kind: 'sensitive_credential_echo' })
+  }
   const responseValue = resultRecord?.response
   const response = isRecord(responseValue) ? responseValue : {}
   const metadata = resultRecord && isRecord(resultRecord.metadata)
@@ -645,6 +725,14 @@ async function collectOne(
     sensitiveCredentialEchoFields,
   )
   const sensitiveCredentialEcho = sensitiveCredentialEchoFields.length > 0
+  if (sensitiveCredentialEcho) {
+    // A credential echo is a task-level incident, not a low-quality sample.
+    // Abort before this sample reaches a checkpoint or JSONL artifact.
+    throw new PaperCollectionRequestError({ kind: 'sensitive_credential_echo' })
+  }
+  if (unredactedRaw.length > 4_096) {
+    throw new PaperCollectionRequestError({ kind: 'response_too_large' })
+  }
   if (providerError && options.abortOnProviderError === true) {
     throw new PaperCollectionRequestError({ kind: 'provider_error' })
   }
@@ -806,6 +894,7 @@ function buildQuality(
   evidence: readonly PaperRawSampleEvidence[],
   expectedSamples: number,
   rawEvidenceSha256: string,
+  transportMetrics: PaperTransportMetrics,
 ): CollectionQuality {
   const count = (category: SampleCategory): number =>
     evidence.filter((sample) => sample.category === category).length
@@ -846,6 +935,8 @@ function buildQuality(
     reasoningTokenCount,
     reasoningUsageObservedSamples,
     rawEvidenceSha256,
+    attemptCount: transportMetrics.attemptCount,
+    retryCount: transportMetrics.retryCount,
   }
 }
 
@@ -914,29 +1005,134 @@ export async function collectBruckner2026PaperFingerprint(
   const concurrency = requirePositiveInteger(options.concurrency ?? 1, 'concurrency')
   const now = options.now ?? (() => new Date())
   const collectedAt = normalizeIsoTimestamp(options.collectedAt ?? now(), 'collectedAt')
-  const manifest = buildBruckner2026Canonical40Manifest()
+  const manifest = buildBruckner2026Canonical40Manifest(options.transportProfileId)
   const jobs = createBruckner2026CollectionJobs(options.samplesPerCell, options.schedulerSeed)
   const evidenceInScheduleOrder = new Array<PaperRawSampleEvidence>(jobs.length)
   let nextJobIndex = 0
   let fatalRequestError: PaperCollectionRequestError | null = null
 
+  const completedEvidence = (): PaperRawSampleEvidence[] =>
+    evidenceInScheduleOrder.filter(
+      (sample): sample is PaperRawSampleEvidence => sample !== undefined,
+    )
+
+  const buildResult = (incompleteReason?: string): PaperCollectionResult => {
+    const evidence = completedEvidence().sort(compareEvidenceOrder)
+    const rawEvidenceJsonl = serializePaperRawEvidenceJsonl(evidence)
+    const rawEvidenceSha256 = sha256(rawEvidenceJsonl)
+    const cellIds = BRUCKNER_2026_CANONICAL40_CELLS.map((cell) => cell.cellId)
+    const plan: CollectionPlan = {
+      planVersion: 1,
+      role: options.role,
+      cellIds,
+      samplesPerCell: options.samplesPerCell,
+      expectedSamples: jobs.length,
+      schedulerSeed: options.schedulerSeed,
+      schedulerPolicy: BRUCKNER_2026_SCHEDULER_POLICY,
+    }
+    const transportMetrics = options.request.getTransportMetrics?.() ?? {
+      attemptCount: evidence.length,
+      retryCount: 0,
+      retryBudgetUsed: 0,
+    }
+    const quality = buildQuality(evidence, jobs.length, rawEvidenceSha256, transportMetrics)
+    const cells: Partial<Record<ProtocolCellId, V2CellDistribution>> = {}
+    for (const cell of BRUCKNER_2026_CANONICAL40_CELLS) {
+      cells[cell.cellId] = buildCellDistribution(
+        cell,
+        evidence.filter((sample) => sample.cellId === cell.cellId),
+      )
+    }
+
+    const fingerprint: FingerprintV2 = {
+      formatVersion: 2,
+      protocol: manifest.protocolId,
+      model: options.model,
+      collectedAt,
+      samplesPerCell: options.samplesPerCell,
+      // This collector never uses the legacy post-reasoning fallback. Observable
+      // contamination is represented solely by quality.directness/counters.
+      postReasoning: false,
+      cells,
+      manifest,
+      plan,
+      quality,
+      completedSamples: quality.completedSamples,
+      expectedSamples: quality.expectedSamples,
+      errorCount: quality.errorSamples,
+      meta: {
+        tool: 'llm-fingerprint-detector',
+        channel: 'paper-profile-direct',
+        source: `doi:${BRUCKNER_2026_CANONICAL40_PROFILE.source.softwareDoi}`,
+        note: 'opt-in canonical Study A profile; raw evidence retained separately',
+      },
+    }
+    if (!quality.complete) {
+      fingerprint.partial = true
+      fingerprint.incompleteReason = incompleteReason ?? 'sampling_in_progress'
+    }
+    validateFingerprint(fingerprint, {
+      sourceLabel: quality.complete ? 'paper collection' : 'paper collection checkpoint',
+      rejectPartial: quality.complete,
+    })
+    return { fingerprint, evidence, rawEvidenceJsonl, jobs }
+  }
+
+  const emitCheckpoint = (incompleteReason = 'sampling_in_progress'): void => {
+    options.onCheckpoint?.(buildResult(incompleteReason))
+  }
+
+  // An initial aggregate-only checkpoint makes a controlled interruption safe
+  // even before the first request finishes. The CLI only exposes it when at
+  // least one evidence record exists.
+  emitCheckpoint()
+
   async function worker(): Promise<void> {
     while (fatalRequestError === null) {
+      if (options.signal?.aborted) {
+        fatalRequestError = new PaperCollectionRequestError({ kind: 'aborted' })
+        return
+      }
       const jobIndex = nextJobIndex
       nextJobIndex += 1
       if (jobIndex >= jobs.length) return
       try {
-        evidenceInScheduleOrder[jobIndex] = await collectOne(
+        const sample = await collectOne(
           options,
           manifest.protocolId,
           jobs[jobIndex],
           now,
         )
+        evidenceInScheduleOrder[jobIndex] = sample
+        // Capture the evidence before reporting progress. A controller that
+        // cancels immediately on this event can therefore still retain it.
+        emitCheckpoint()
+        const evidence = completedEvidence()
+        const transportMetrics = options.request.getTransportMetrics?.() ?? {
+          attemptCount: evidence.length,
+          retryCount: 0,
+          retryBudgetUsed: 0,
+        }
+        options.onProgress?.({
+          stage: 'sampling',
+          done: evidence.length,
+          total: jobs.length,
+          errors: evidence.filter((item) => item.category === 'error').length,
+          cellId: sample.cellId,
+          detail: null,
+          lastErrorKind: sample.errorKind,
+          lastHttpStatus: null,
+          retrying: false,
+          attemptCount: transportMetrics.attemptCount,
+          retryCount: transportMetrics.retryCount,
+          retryBudgetUsed: transportMetrics.retryBudgetUsed,
+        })
       } catch (error) {
         if (fatalRequestError === null) {
           fatalRequestError = error instanceof PaperCollectionRequestError
             ? error
             : new PaperCollectionRequestError(error)
+          options.request.abortInFlight?.()
         }
         return
       }
@@ -946,53 +1142,15 @@ export async function collectBruckner2026PaperFingerprint(
   await Promise.all(
     Array.from({ length: Math.min(concurrency, jobs.length) }, () => worker()),
   )
-  if (fatalRequestError !== null) throw fatalRequestError
-
-  const evidence = [...evidenceInScheduleOrder].sort(compareEvidenceOrder)
-  const rawEvidenceJsonl = serializePaperRawEvidenceJsonl(evidence)
-  const rawEvidenceSha256 = sha256(rawEvidenceJsonl)
-  const cellIds = BRUCKNER_2026_CANONICAL40_CELLS.map((cell) => cell.cellId)
-  const plan: CollectionPlan = {
-    planVersion: 1,
-    role: options.role,
-    cellIds,
-    samplesPerCell: options.samplesPerCell,
-    expectedSamples: jobs.length,
-    schedulerSeed: options.schedulerSeed,
-    schedulerPolicy: BRUCKNER_2026_SCHEDULER_POLICY,
-  }
-  const quality = buildQuality(evidence, jobs.length, rawEvidenceSha256)
-  const cells: Partial<Record<ProtocolCellId, V2CellDistribution>> = {}
-  for (const cell of BRUCKNER_2026_CANONICAL40_CELLS) {
-    cells[cell.cellId] = buildCellDistribution(
-      cell,
-      evidence.filter((sample) => sample.cellId === cell.cellId),
+  const collectionError = fatalRequestError as PaperCollectionRequestError | null
+  if (collectionError !== null) {
+    emitCheckpoint(
+      collectionError.kind === 'aborted' ? 'sampling_interrupted' : 'sampling_failed',
     )
+    throw collectionError
   }
 
-  const fingerprint: FingerprintV2 = {
-    formatVersion: 2,
-    protocol: manifest.protocolId,
-    model: options.model,
-    collectedAt,
-    samplesPerCell: options.samplesPerCell,
-    // This collector never uses the legacy post-reasoning fallback. Observable
-    // contamination is represented solely by quality.directness/counters.
-    postReasoning: false,
-    cells,
-    manifest,
-    plan,
-    quality,
-    completedSamples: quality.completedSamples,
-    expectedSamples: quality.expectedSamples,
-    errorCount: quality.errorSamples,
-    meta: {
-      tool: 'llm-fingerprint-detector',
-      channel: 'paper-profile-direct',
-      source: `doi:${BRUCKNER_2026_CANONICAL40_PROFILE.source.softwareDoi}`,
-      note: 'opt-in canonical Study A profile; raw evidence retained separately',
-    },
-  }
-  validateFingerprint(fingerprint, { sourceLabel: 'paper collection', rejectPartial: true })
-  return { fingerprint, evidence, rawEvidenceJsonl, jobs }
+  const result = buildResult()
+  options.onCheckpoint?.(result)
+  return result
 }

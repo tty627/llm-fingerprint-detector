@@ -10,6 +10,8 @@ import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 
 const CLI_PATH = fileURLToPath(new URL('../dist/cli.js', import.meta.url))
+process.env.LLMFP_ALLOW_INSECURE_LOOPBACK_FOR_TESTS = '1'
+const TEST_ENV = { ...process.env }
 
 async function listen(server) {
   server.listen(0, '127.0.0.1')
@@ -153,12 +155,256 @@ test('paper-fingerprint CLI writes V2 + SHA-bound JSONL without leaking headers 
   }
 })
 
+test('paper-fingerprint emits per-sample progress and retains SHA-bound partials on SIGTERM', async () => {
+  let requests = 0
+  const server = createServer((request, response) => {
+    request.resume()
+    request.on('end', () => {
+      requests += 1
+      if (requests !== 1) return
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(
+        JSON.stringify({
+          model: 'paper-progress-model',
+          choices: [{ message: { role: 'assistant', content: '7' }, finish_reason: 'stop' }],
+          usage: {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            completion_tokens_details: { reasoning_tokens: 0 },
+          },
+        }),
+      )
+    })
+  })
+  const tempDir = await mkdtemp(join(tmpdir(), 'llm-paper-partial-'))
+  const fingerprintPath = join(tempDir, 'audit.partial.json')
+  const samplesPath = join(tempDir, 'audit.partial.jsonl')
+  const secret = 'paper-partial-key-must-not-leak'
+  let child
+
+  try {
+    const baseUrl = await listen(server)
+    child = spawn(
+      process.execPath,
+      [
+        CLI_PATH,
+        'paper-fingerprint',
+        '--base-url', baseUrl,
+        '--model', 'paper-progress-model',
+        '--api-key-env', 'PAPER_PARTIAL_TEST_KEY',
+        '--role', 'audit',
+        '--scheduler-seed', 'partial-seed',
+        '--samples', '1',
+        '--concurrency', '1',
+        '--timeout', '10000',
+        '--out', fingerprintPath,
+        '--samples-out', samplesPath,
+        '--json',
+      ],
+      {
+        env: { ...TEST_ENV, PAPER_PARTIAL_TEST_KEY: secret },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    )
+    const stdout = []
+    const stderr = []
+    child.stdout.on('data', (chunk) => stdout.push(chunk))
+    let pendingStderr = ''
+    const sawFirstSample = new Promise((resolve) => {
+      child.stderr.on('data', (chunk) => {
+        stderr.push(chunk)
+        pendingStderr += chunk.toString('utf8')
+        const lines = pendingStderr.split('\n')
+        pendingStderr = lines.pop() ?? ''
+        for (const line of lines) {
+          if (!line.startsWith('LLMFP_PROGRESS ')) continue
+          const event = JSON.parse(line.slice('LLMFP_PROGRESS '.length))
+          if (event.stage === 'sampling' && event.done === 1 && event.retrying === false) {
+            resolve()
+          }
+        }
+      })
+    })
+
+    await Promise.race([
+      sawFirstSample,
+      new Promise((_, reject) => {
+        const timer = setTimeout(() => reject(new Error('no paper progress')), 5_000)
+        timer.unref()
+      }),
+    ])
+    child.kill('SIGTERM')
+    const [code, signal] = await once(child, 'close')
+    const stdoutText = Buffer.concat(stdout).toString('utf8')
+    const stderrText = Buffer.concat(stderr).toString('utf8')
+    const fingerprintText = await readFile(fingerprintPath, 'utf8')
+    const samplesText = await readFile(samplesPath, 'utf8')
+    const fingerprint = JSON.parse(fingerprintText)
+
+    assert.equal(code, 1)
+    assert.equal(signal, null)
+    assert.equal(fingerprint.partial, true)
+    assert.equal(fingerprint.completedSamples, 1)
+    assert.equal(fingerprint.expectedSamples, 40)
+    assert.equal(fingerprint.incompleteReason, 'sampling_interrupted')
+    assert.equal(samplesText.trimEnd().split('\n').length, 1)
+    assert.equal(
+      fingerprint.quality.rawEvidenceSha256,
+      createHash('sha256').update(samplesText, 'utf8').digest('hex'),
+    )
+    assert.match(stderrText, /"stage":"sampling","done":1,"total":40/)
+    assert.match(stderrText, /partial evidence retained after SIGTERM: 1\/40/)
+    for (const persisted of [fingerprintText, samplesText, stdoutText, stderrText]) {
+      assert.equal(persisted.includes(secret), false)
+    }
+  } finally {
+    if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    await closeServer(server)
+    await rm(tempDir, { recursive: true, force: true })
+  }
+})
+
+test('paper-fingerprint CLI selects the strict Anthropic profile and binds it into the artifact', async () => {
+  const requests = []
+  const secret = 'paper-anthropic-cli-key-must-not-leak'
+  const server = createServer((request, response) => {
+    const chunks = []
+    request.on('data', (chunk) => chunks.push(chunk))
+    request.on('end', () => {
+      requests.push({
+        url: request.url,
+        headers: request.headers,
+        body: JSON.parse(Buffer.concat(chunks).toString('utf8')),
+      })
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({
+        id: `msg-${requests.length}`,
+        type: 'message',
+        role: 'assistant',
+        model: 'claude-opus-5-reported',
+        content: [{ type: 'text', text: '7' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 8, output_tokens: 1 },
+      }))
+    })
+  })
+  const tempDir = await mkdtemp(join(tmpdir(), 'llm-paper-anthropic-'))
+  const fingerprintPath = join(tempDir, 'anthropic.json')
+  const samplesPath = join(tempDir, 'anthropic.jsonl')
+
+  try {
+    const baseUrl = await listen(server)
+    const child = spawn(process.execPath, [
+      CLI_PATH,
+      'paper-fingerprint',
+      '--base-url', baseUrl,
+      '--model', 'claude-opus-5',
+      '--api-key-env', 'PAPER_ANTHROPIC_TEST_KEY',
+      '--transport-profile', 'anthropic-messages-opus5-onetoken-v1',
+      '--anthropic-workspace-id', 'wrk_cli_fixture',
+      '--role', 'enrollment',
+      '--scheduler-seed', 'anthropic-cli-seed',
+      '--samples', '1',
+      '--concurrency', '3',
+      '--retry-budget', '3',
+      '--out', fingerprintPath,
+      '--samples-out', samplesPath,
+      '--json',
+    ], {
+      env: { ...TEST_ENV, PAPER_ANTHROPIC_TEST_KEY: secret },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    const stdout = []
+    const stderr = []
+    child.stdout.on('data', (chunk) => stdout.push(chunk))
+    child.stderr.on('data', (chunk) => stderr.push(chunk))
+    const [code, signal] = await Promise.race([
+      once(child, 'close'),
+      new Promise((_, reject) => {
+        const timer = setTimeout(() => {
+          child.kill('SIGKILL')
+          reject(new Error('Anthropic CLI timed out'))
+        }, 10_000)
+        timer.unref()
+      }),
+    ])
+    const stdoutText = Buffer.concat(stdout).toString('utf8')
+    const stderrText = Buffer.concat(stderr).toString('utf8')
+    assert.equal(code, 0, stderrText)
+    assert.equal(signal, null)
+    assert.equal(requests.length, 40)
+    for (const observed of requests) {
+      assert.equal(observed.url, '/v1/messages')
+      assert.equal(observed.headers['x-api-key'], secret)
+      assert.equal(observed.headers['anthropic-version'], '2023-06-01')
+      assert.equal(observed.headers['anthropic-workspace-id'], 'wrk_cli_fixture')
+      assert.equal(observed.body.model, 'claude-opus-5')
+      assert.equal(observed.body.temperature, 1)
+      assert.equal(observed.body.max_tokens, 16)
+      assert.deepEqual(observed.body.thinking, { type: 'disabled' })
+      assert.deepEqual(observed.body.output_config, { effort: 'high' })
+      assert.equal(typeof observed.body.system, 'string')
+      assert.deepEqual(observed.body.messages.map((item) => item.role), ['user'])
+      for (const forbidden of ['top_p', 'top_k', 'tools', 'seed', 'stream', 'reasoning', 'usage']) {
+        assert.equal(Object.hasOwn(observed.body, forbidden), false)
+      }
+    }
+
+    const fingerprintText = await readFile(fingerprintPath, 'utf8')
+    const samplesText = await readFile(samplesPath, 'utf8')
+    const fingerprint = JSON.parse(fingerprintText)
+    const summary = JSON.parse(stdoutText)
+    const progressEvents = stderrText
+      .split('\n')
+      .filter((line) => line.startsWith('LLMFP_PROGRESS '))
+      .map((line) => JSON.parse(line.slice('LLMFP_PROGRESS '.length)))
+    assert.ok(progressEvents.length >= 80)
+    for (const event of progressEvents) {
+      assert.equal(Number.isSafeInteger(event.attemptCount), true)
+      assert.equal(Number.isSafeInteger(event.retryCount), true)
+      assert.equal(Number.isSafeInteger(event.retryBudgetUsed), true)
+    }
+    for (let index = 1; index < progressEvents.length; index += 1) {
+      assert.ok(progressEvents[index].attemptCount >= progressEvents[index - 1].attemptCount)
+      assert.ok(progressEvents[index].retryCount >= progressEvents[index - 1].retryCount)
+      assert.ok(
+        progressEvents[index].retryBudgetUsed >= progressEvents[index - 1].retryBudgetUsed,
+      )
+    }
+    assert.deepEqual(
+      {
+        attemptCount: progressEvents.at(-1).attemptCount,
+        retryCount: progressEvents.at(-1).retryCount,
+        retryBudgetUsed: progressEvents.at(-1).retryBudgetUsed,
+      },
+      { attemptCount: 40, retryCount: 0, retryBudgetUsed: 0 },
+    )
+    assert.equal(
+      fingerprint.manifest.transportProfileId,
+      'anthropic-messages-opus5-onetoken-v1',
+    )
+    assert.equal(fingerprint.quality.attemptCount, 40)
+    assert.equal(fingerprint.quality.retryCount, 0)
+    assert.equal(summary.collection.transportProfileId, fingerprint.manifest.transportProfileId)
+    assert.equal(summary.collection.attemptCount, 40)
+    assert.equal(summary.collection.retryCount, 0)
+    for (const persisted of [fingerprintText, samplesText, stdoutText, stderrText]) {
+      assert.equal(persisted.includes(secret), false)
+    }
+  } finally {
+    await closeServer(server)
+    await rm(tempDir, { recursive: true, force: true })
+  }
+})
+
 test('paper-fingerprint is explicit, requires collection metadata, and documents default 30', () => {
   const help = spawnSync(process.execPath, [CLI_PATH, '--help'], { encoding: 'utf8' })
   assert.equal(help.status, 0, help.stderr)
   assert.match(help.stdout, /paper-fingerprint/)
   assert.match(help.stdout, /exact T=1 Study-A 40-cell collection profile/)
   assert.match(help.stdout, /Samples per each of 40 cells \(default: 30\)/)
+  assert.match(help.stdout, /paper-fingerprint default\/max: 30000/)
+  assert.match(help.stdout, /Batch-wide extra-attempt budget \(default\/max: 240\)/)
   assert.match(help.stdout, /not a\n  full reproduction of the paper's EER evaluation/)
   assert.match(help.stdout, /does not produce a model-identity conclusion/)
 

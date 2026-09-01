@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 
 const CLI_PATH = fileURLToPath(new URL('../dist/cli.js', import.meta.url))
+process.env.LLMFP_ALLOW_INSECURE_LOOPBACK_FOR_TESTS = '1'
 
 function cell(cellId, answer) {
   return {

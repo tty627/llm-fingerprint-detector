@@ -289,7 +289,7 @@ test('assistant role is required for a structurally direct response', async () =
   assert.ok(result.evidence.every((sample) => sample.errorKind === 'malformed_response'))
 })
 
-test('transport credential echoes are redacted from every persisted response field and excluded', async () => {
+test('transport credential echoes abort the collection before evidence is returned', async () => {
   const secret = 'paper-credential-echo-must-never-persist'
   const request = createOpenAICompatiblePaperTransport({
     baseUrl: 'https://offline.invalid/v1',
@@ -311,20 +311,37 @@ test('transport credential echoes are redacted from every persisted response fie
       },
     }), { status: 200, headers: { 'content-type': 'application/json' } }),
   })
-  const result = await collectBruckner2026PaperFingerprint(
-    baseOptions(request, { concurrency: 8 }),
+  await assert.rejects(
+    collectBruckner2026PaperFingerprint(baseOptions(request, { concurrency: 8 })),
+    (error) => {
+      assert.equal(error.kind, 'sensitive_credential_echo')
+      assert.equal(error.message.includes(secret), false)
+      return true
+    },
   )
-
-  assert.equal(result.rawEvidenceJsonl.includes(secret), false)
-  assert.equal(JSON.stringify(result.fingerprint).includes(secret), false)
-  assert.equal(result.fingerprint.quality.errorSamples, 40)
-  assert.equal(result.fingerprint.quality.directness, 'unknown')
-  assert.ok(result.evidence.every((sample) => sample.errorKind === 'sensitive_credential_echo'))
-  assert.ok(result.evidence.every((sample) => sample.excludedFromDistribution))
-  assert.ok(result.evidence.every((sample) => sample.sensitiveCredentialEchoFields.length === 5))
 })
 
-test('credential echoes in adapter metadata are redacted before truncation and excluded', async () => {
+test('credential echo normalization variants also abort before checkpointing', async () => {
+  const secret = 'sk-Live-CredentialEcho'
+  for (const echoed of ['SK-LIVE-CREDENTIAL ECHO', 'sklivecredentialecho']) {
+    const request = createOpenAICompatiblePaperTransport({
+      baseUrl: 'https://offline.invalid/v1',
+      apiKey: secret,
+      retries: 0,
+      fetchImpl: async () => new Response(JSON.stringify({
+        model: 'model',
+        choices: [{ message: { role: 'assistant', content: echoed }, finish_reason: 'stop' }],
+        usage: { completion_tokens: 1, completion_tokens_details: { reasoning_tokens: 0 } },
+      }), { status: 200, headers: { 'content-type': 'application/json' } }),
+    })
+    await assert.rejects(
+      collectBruckner2026PaperFingerprint(baseOptions(request, { concurrency: 1 })),
+      (error) => error.kind === 'sensitive_credential_echo',
+    )
+  }
+})
+
+test('credential echoes in adapter metadata abort the collection', async () => {
   const secret = 'metadata-credential-echo-must-never-persist'
   const request = async (_body, context) => {
     const fixture = cleanResponse(context.job)
@@ -342,20 +359,14 @@ test('credential echoes in adapter metadata are redacted before truncation and e
     }),
   })
 
-  const result = await collectBruckner2026PaperFingerprint(
-    baseOptions(request, { concurrency: 8 }),
+  await assert.rejects(
+    collectBruckner2026PaperFingerprint(baseOptions(request, { concurrency: 8 })),
+    (error) => {
+      assert.equal(error.kind, 'sensitive_credential_echo')
+      assert.equal(error.message.includes(secret), false)
+      return true
+    },
   )
-
-  assert.equal(result.rawEvidenceJsonl.includes(secret), false)
-  assert.equal(JSON.stringify(result.fingerprint).includes(secret), false)
-  assert.equal(result.fingerprint.quality.errorSamples, 40)
-  assert.ok(result.evidence.every((sample) => sample.errorKind === 'sensitive_credential_echo'))
-  assert.ok(result.evidence.every((sample) => sample.excludedFromDistribution))
-  assert.ok(result.evidence.every((sample) => (
-    sample.sensitiveCredentialEchoFields.includes('provider')
-    && sample.sensitiveCredentialEchoFields.includes('reportedModel')
-    && sample.sensitiveCredentialEchoFields.includes('generationId')
-  )))
 })
 
 test('structurally malformed responses are errors, excluded, and never treated as direct output', async () => {
